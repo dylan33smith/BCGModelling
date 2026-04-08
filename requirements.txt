@@ -1,0 +1,67 @@
+# =============================================================================
+# BCGModelling — Pinned Requirements
+# Last updated: 2026-04-07
+#
+# IMPORTANT: All scripts must be run inside the bgcmodel conda environment:
+#   conda activate bgcmodel
+#
+# The full environment is defined in environment.yml (conda) plus the GPU
+# stack below (pip). To recreate from scratch:
+#   conda env create -f environment.yml
+#   conda activate bgcmodel
+#   pip install -r requirements.txt
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Core (also in environment.yml — listed here for pip-only installs)
+# -----------------------------------------------------------------------------
+biopython>=1.83           # GenBank parsing, sequence I/O
+PyYAML>=6.0               # Config / class map loading
+pyhmmer>=0.10             # Metric 2: Pfam domain recovery (HMMER3 bindings)
+
+# -----------------------------------------------------------------------------
+# Evaluation — CPU metrics (Tier 1 / 2)
+# -----------------------------------------------------------------------------
+dnachisel[reports]>=3.2   # Metric 4: synthesis feasibility (Twist/IDT constraints)
+CodonTransformer>=1.0     # Metric 7: CAI vs E. coli K-12 (optional, has built-in fallback)
+
+# -----------------------------------------------------------------------------
+# GPU stack — MUST be installed in this exact order
+#
+# Version constraints are critical:
+#   torch 2.5.1:      last version before PyTorch 2.6 changed the c10::Error
+#                     ABI, which breaks flash-attn compilation
+#   flash-attn 2.7.4: first version compatible with torch 2.5.1 + CUDA 12.4
+#   transformers 4.46.3: last 4.x release; 5.x added a torch>=2.6 guard on
+#                     torch.load() that blocks loading .pt ESMFold weights
+#   evo2 0.5.5:       Arc Institute PyPI release; loads evo2_7b_262k from HF
+#
+# Install order:
+#   1. pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 \
+#          --index-url https://download.pytorch.org/whl/cu124
+#   2. pip install flash-attn==2.7.4.post1 --no-build-isolation
+#   3. pip install transformers==4.46.3 accelerate==1.13.0
+#   4. pip install evo2==0.5.5
+# -----------------------------------------------------------------------------
+
+# PyTorch (install via --index-url, see above)
+# torch==2.5.1+cu124
+# torchvision==0.20.1+cu124
+
+# Flash attention (must build from source against installed torch)
+# flash-attn==2.7.4.post1
+
+# HuggingFace stack
+transformers==4.46.3      # Metric 3: EsmForProteinFolding (no OpenFold required)
+accelerate==1.13.0        # Required by transformers for model offloading
+huggingface-hub==0.36.2   # Model weight downloads
+
+# Evo2 + dependencies
+evo2==0.5.5               # Metric 5: sequence perplexity (loads evo2_7b_262k)
+vtx==1.0.8                # Vortex / StripedHyena2 runtime (installed by evo2)
+einops==0.8.1             # Required by vtx
+
+# Supporting GPU libs (installed automatically as torch dependencies)
+# nvidia-cuda-runtime-cu12==12.4.127
+# nvidia-cudnn-cu12==9.1.0.70
+# nvidia-cublas-cu12==12.4.5.8

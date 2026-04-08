@@ -1,0 +1,40 @@
+name: bgcmodel
+# =============================================================================
+# BCGModelling conda environment
+# Last updated: 2026-04-07
+#
+# Creates the full bgcmodel environment with all CPU-based tools.
+# GPU stack (torch, flash-attn, transformers, evo2) is installed
+# separately via pip after conda env creation — see requirements.txt.
+#
+# To create:
+#   conda env create -f environment.yml
+#   conda activate bgcmodel
+#
+# Then install GPU stack (requires CUDA 12.4, A40 or similar):
+#   pip install torch==2.5.1+cu124 torchvision==0.20.1+cu124 \
+#       --index-url https://download.pytorch.org/whl/cu124
+#   pip install flash-attn==2.7.4.post1 --no-build-isolation
+#   pip install transformers==4.46.3 accelerate==1.13.0
+#   pip install evo2==0.5.5
+#
+# Then download antiSMASH reference databases (one-time, ~15 GB):
+#   download-antismash-databases
+# =============================================================================
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  # antiSMASH drives Python version (resolves to Python 3.12.13)
+  - antismash>=7.0        # Metric 1: BGC class identification (v8.0.4 installed)
+  - pyyaml>=6.0           # Config / class map loading
+  - pyhmmer>=0.10         # Metric 2: Pfam domain recovery
+  - mmseqs2               # Metric 8: protein homology vs UniRef50
+  - foldseek              # Metric 3 (optional): structural search vs PDB/AlphaFold
+  - bigscape>=2.0         # Metric 6: BGC novelty / coherence
+  - prodigal              # Gene finding (required by antiSMASH)
+  - pip
+  - pip:
+    - "dnachisel[reports]>=3.2"   # Metric 4: synthesis feasibility
+    - "biopython>=1.83"           # GenBank parsing (also pulled in by antismash)

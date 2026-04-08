@@ -1,0 +1,126 @@
+# Harmonised COMPOUND_CLASS tokens (uppercase) for training.
+# This mapping unifies MIBiG biosynthesis.classes[].class and antiSMASH
+# predicted product types into a shared vocabulary (Section 4.2 of plan).
+#
+# Keys are matched case-insensitively.
+# "source" comments indicate which database uses each key.
+
+mappings:
+  # --- MIBiG biosynthesis classes (all 6 found in MIBiG 4.0) ---
+  PKS: PKS                    # MIBiG + antiSMASH (T1PKS, T2PKS, T3PKS, transAT-PKS, hglE-KS)
+  NRPS: NRPS                  # MIBiG + antiSMASH
+  terpene: TERPENE             # MIBiG + antiSMASH
+  saccharide: SACCHARIDE       # MIBiG + antiSMASH
+  ribosomal: RIPP              # MIBiG (maps to antiSMASH RiPP subtypes below)
+  other: OTHER                 # MIBiG catch-all
+
+  # --- antiSMASH product types -> harmonised classes ---
+  # PKS subtypes
+  T1PKS: PKS
+  T2PKS: PKS
+  T3PKS: PKS
+  transAT-PKS: PKS
+  hglE-KS: PKS
+
+  # NRPS-like
+  NRPS-like: NRPS
+  thioamide-NRP: NRPS
+  isocyanide-nrp: NRPS
+  NAPAA: NRPS
+
+  # PKS-NRPS hybrids
+  PKS-NRPS_Hybrids: PKS_NRPS_HYBRID
+  NRPS-PKS_Hybrids: PKS_NRPS_HYBRID
+
+  # RiPP subtypes (antiSMASH)
+  lanthipeptide: RIPP
+  lantipeptide: RIPP
+  lanthipeptide-class-i: RIPP
+  lanthipeptide-class-ii: RIPP
+  lanthipeptide-class-iii: RIPP
+  lanthipeptide-class-iv: RIPP
+  lanthipeptide-class-v: RIPP
+  thiopeptide: RIPP
+  lassopeptide: RIPP
+  sactipeptide: RIPP
+  bottromycin: RIPP
+  cyanobactin: RIPP
+  head_to_tail: RIPP
+  microcin: RIPP
+  microviridin: RIPP
+  proteusin: RIPP
+  LAP: RIPP
+  RaS-RiPP: RIPP
+  fungal-RiPP: RIPP
+  ranthipeptide: RIPP
+  epipeptide: RIPP
+  glycocin: RIPP
+  linaridin: RIPP
+  lipolanthine: RIPP
+  RRE-containing: RIPP
+  redox-cofactor: RIPP
+  darobactin: RIPP
+  triceptide: RIPP
+  spliceotide: RIPP
+  RiPP-like: RIPP
+
+  # Terpene subtypes
+  terpene: TERPENE
+
+  # Saccharide subtypes
+  oligosaccharide: SACCHARIDE
+  amglyccycl: SACCHARIDE
+  aminocoumarin: SACCHARIDE
+
+  # Siderophores / metallophores
+  siderophore: SIDEROPHORE
+  NRP-metallophore: SIDEROPHORE
+  NRPS-independent-siderophore: SIDEROPHORE
+
+  # Alkaloids
+  alkaloid: ALKALOID
+  indole: ALKALOID
+
+  # Other specific antiSMASH types
+  betalactone: BETALACTONE
+  melanin: MELANIN
+  nucleoside: NUCLEOSIDE
+  phosphonate: PHOSPHONATE
+  phenazine: PHENAZINE
+  butyrolactone: BUTYROLACTONE
+  ectoine: ECTOINE
+  PBDE: PBDE
+  hserlactone: HSERLACTONE
+  arylpolyene: ARYLPOLYENE
+  resorcinol: RESORCINOL
+  ladderane: LADDERANE
+  CDPS: CDPS
+  furan: FURAN
+  phosphoglycolipid: PHOSPHOGLYCOLIPID
+  tropodithietic-acid: OTHER
+  NAGGN: OTHER
+  blactam: BETALACTAM
+  acyl_amino_acids: OTHER
+  PUFA: PUFA
+
+  # antiSMASH v5 / v8 product types not present in earlier versions
+  azole-containing-RiPP: RIPP        # azole-containing RiPP (thioazole/oxazole)
+  thioamitides: RIPP                  # thioamide-containing RiPP
+  lanthipeptide-class-vi: RIPP        # additional lanthipeptide subclass
+  cyclic-lactone-autoinducer: RIPP    # cyclic-lactone autoinducer peptides
+  terpene-precursor: TERPENE          # terpene precursor biosynthetic clusters
+  t3nrps-iterative: NRPS              # iterative type III NRPS
+  hydrogen-cyanide: OTHER             # hydrogen cyanide (HCN) clusters
+  cf_putative: OTHER                  # ClusterFinder putative (low-confidence)
+  cf_fatty_acid: OTHER                # ClusterFinder fatty acid
+  cf_saccharide: SACCHARIDE           # ClusterFinder saccharide
+  cf_polyprenyl: TERPENE              # ClusterFinder polyprenyl
+  cf_resorcinol: RESORCINOL           # ClusterFinder resorcinol
+  prodiginine: ALKALOID               # prodiginine alkaloid pigments
+  mycosporine-like: OTHER             # mycosporine-like amino acid derivatives
+  acyl_amino_acids: OTHER             # acyl amino acids
+  HR-T2PKS: PKS                       # highly reducing type II PKS
+  CDPS: CDPS                          # cyclodipeptide synthase (already present, alias)
+  nitrous-oxide: OTHER                # nitrous oxide clusters
+
+default_class: OTHER
