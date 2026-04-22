@@ -237,19 +237,24 @@ def taxa_tag_for_gbk(
 # GenBank parsing
 # ---------------------------------------------------------------------------
 
-def _parse_gbk_bytes(raw_bytes: bytes, member_name: str) -> SeqRecord | None:
-    """Decompress (if .gz) and parse a GenBank byte string into a SeqRecord."""
+def _parse_gbk_bytes(raw_bytes: bytes, member_name: str) -> list[SeqRecord]:
+    """Decompress (if .gz) and parse ALL records from a GenBank byte string.
+
+    antiSMASH GBKs for fragmented assemblies contain one record per contig.
+    We must iterate all records to find every BGC region.
+    Returns an empty list on parse failure.
+    """
     try:
         data = gzip.decompress(raw_bytes) if member_name.endswith(".gz") else raw_bytes
         handle = io.StringIO(data.decode("ascii", errors="replace"))
-        return next(SeqIO.parse(handle, "genbank"))
-    except (StopIteration, Exception) as exc:
+        return list(SeqIO.parse(handle, "genbank"))
+    except Exception as exc:
         print(f"  WARNING: failed to parse {member_name}: {exc}", file=sys.stderr)
-        return None
+        return []
 
 
 def _iter_antismash_regions(
-    record: SeqRecord,
+    records: list[SeqRecord],
     genome_acc: str,
     gbk_text: str,
     class_mapping: dict[str, str],
@@ -260,7 +265,11 @@ def _iter_antismash_regions(
     max_length: int,
     min_length: int,
 ) -> Iterator[dict]:
-    """Yield one training-record dict per antiSMASH ``region`` feature."""
+    """Yield one training-record dict per antiSMASH ``region`` feature.
+
+    Iterates ALL records in the GBK (handles fragmented multi-contig assemblies).
+    Taxonomy tag is resolved once per genome from the full GBK text.
+    """
 
     # --- Resolve taxonomy tag once per genome ---
     # Priority: taxa JSON fast-path → NCBI taxdump → GenBank fallback
@@ -270,48 +279,53 @@ def _iter_antismash_regions(
     if tax_tag is None:
         tax_tag = build_taxonomic_tag(gbk_text, taxonomy=taxonomy)
 
-    full_seq = str(record.seq).upper()
+    for record in records:
+        full_seq = str(record.seq).upper()
 
-    for feature in record.features:
-        if feature.type != "region":
-            continue
-        if feature.qualifiers.get("tool") != ["antismash"]:
-            continue
+        for feature in record.features:
+            if feature.type != "region":
+                continue
+            if feature.qualifiers.get("tool") != ["antismash"]:
+                continue
 
-        products: list[str] = feature.qualifiers.get("product", [])
-        region_number: str = feature.qualifiers.get("region_number", ["?"])[0]
-        compound_class = map_region_products(products, class_mapping, class_default)
+            products: list[str] = feature.qualifiers.get("product", [])
+            region_number: str = feature.qualifiers.get("region_number", ["?"])[0]
+            compound_class = map_region_products(products, class_mapping, class_default)
+            contig_edge: bool = (
+                feature.qualifiers.get("contig_edge", ["False"])[0].strip().lower() == "true"
+            )
 
-        start = int(feature.location.start)
-        end = int(feature.location.end)
-        region_seq = full_seq[start:end]
+            start = int(feature.location.start)
+            end = int(feature.location.end)
+            region_seq = full_seq[start:end]
 
-        if len(region_seq) < min_length:
-            continue
+            if len(region_seq) < min_length:
+                continue
 
-        if len(region_seq) > max_length:
-            # Centre-truncate to fit Evo2's context window
-            mid = (start + end) // 2
-            half = max_length // 2
-            trunc_start = max(0, mid - half)
-            region_seq = full_seq[trunc_start: trunc_start + max_length]
+            if len(region_seq) > max_length:
+                # Centre-truncate to fit Evo2's context window
+                mid = (start + end) // 2
+                half = max_length // 2
+                trunc_start = max(0, mid - half)
+                region_seq = full_seq[trunc_start: trunc_start + max_length]
 
-        accession = f"{genome_acc}.region{region_number}"
-        training_text = f"|COMPOUND_CLASS:{compound_class}|{tax_tag}{region_seq}"
+            accession = f"{genome_acc}.region{region_number}"
+            training_text = f"|COMPOUND_CLASS:{compound_class}|{tax_tag}{region_seq}"
 
-        yield {
-            "accession": accession,
-            "genome_accession": genome_acc,
-            "region_number": int(region_number) if region_number.isdigit() else region_number,
-            "compound_class": compound_class,
-            "antismash_products": products,
-            "region_start": start,
-            "region_end": end,
-            "taxonomic_tag": tax_tag,
-            "sequence": region_seq,
-            "training_text": training_text,
-            "gbk_member": genome_acc,
-        }
+            yield {
+                "accession": accession,
+                "genome_accession": genome_acc,
+                "region_number": int(region_number) if region_number.isdigit() else region_number,
+                "compound_class": compound_class,
+                "antismash_products": products,
+                "contig_edge": contig_edge,
+                "region_start": start,
+                "region_end": end,
+                "taxonomic_tag": tax_tag,
+                "sequence": region_seq,
+                "training_text": training_text,
+                "gbk_member": genome_acc,
+            }
 
 
 # ---------------------------------------------------------------------------
@@ -329,12 +343,28 @@ def iter_asdb5_records(
     max_length: int,
     min_length: int,
     limit: int | None,
+    resume_after: str | None = None,
+    only_genomes: set[str] | None = None,
 ) -> Iterator[dict]:
     """Stream ``tar_path`` and yield one dict per antiSMASH BGC region.
 
     Handles truncated / still-downloading tars gracefully.
+    If ``resume_after`` is set, skip all genomes up to and including that accession.
+    If ``only_genomes`` is set, only process genomes in that set.
     """
     yielded = 0
+    # Resume support: skip genomes until we pass resume_after
+    skipping = resume_after is not None
+    if skipping:
+        print(
+            f"  Resume mode: skipping genomes up to and including {resume_after}",
+            file=sys.stderr,
+        )
+    if only_genomes is not None:
+        print(
+            f"  Patch mode: processing {len(only_genomes):,} specific genomes only",
+            file=sys.stderr,
+        )
 
     try:
         tf = tarfile.open(tar_path, "r:*")
@@ -360,6 +390,16 @@ def iter_asdb5_records(
             else:
                 genome_acc = stem
 
+            # Resume: skip until we've passed the resume_after genome
+            if skipping:
+                if genome_acc == resume_after:
+                    skipping = False  # next genome will be processed
+                continue
+
+            # Patch mode: only process specific genomes
+            if only_genomes is not None and genome_acc not in only_genomes:
+                continue
+
             if genome_acc in heldout:
                 continue
 
@@ -368,8 +408,8 @@ def iter_asdb5_records(
                 continue
             raw = fobj.read()
 
-            record = _parse_gbk_bytes(raw, name)
-            if record is None:
+            records = _parse_gbk_bytes(raw, name)
+            if not records:
                 continue
 
             try:
@@ -382,7 +422,7 @@ def iter_asdb5_records(
                 gbk_text = ""
 
             for rec_dict in _iter_antismash_regions(
-                record, genome_acc, gbk_text,
+                records, genome_acc, gbk_text,
                 class_mapping, class_default,
                 taxa_map, deprecated_ids, taxonomy,
                 max_length, min_length,
@@ -466,6 +506,27 @@ def main() -> None:
         default=None,
         help="Stop after N records (testing only)",
     )
+    parser.add_argument(
+        "--resume-after",
+        type=str,
+        default=None,
+        help="Genome accession (e.g. GCF_902832935.1) to resume after; "
+             "skips all genomes up to and including this one. "
+             "Use --append to append to an existing output file.",
+    )
+    parser.add_argument(
+        "--append",
+        action="store_true",
+        default=False,
+        help="Open output in append mode (use with --resume-after)",
+    )
+    parser.add_argument(
+        "--only-genomes-file",
+        type=Path,
+        default=None,
+        help="File with one genome accession per line; only those genomes are processed. "
+             "Used to patch a previous run that missed certain genomes.",
+    )
     args = parser.parse_args()
 
     # Class map
@@ -523,6 +584,19 @@ def main() -> None:
         }
         print(f"Loaded {len(heldout):,} heldout accessions.", file=sys.stderr)
 
+    # Only-genomes filter
+    only_genomes: set[str] | None = None
+    if args.only_genomes_file is not None:
+        if not args.only_genomes_file.is_file():
+            print(f"ERROR: --only-genomes-file not found: {args.only_genomes_file}", file=sys.stderr)
+            sys.exit(1)
+        only_genomes = {
+            ln.strip()
+            for ln in args.only_genomes_file.read_text("utf-8").splitlines()
+            if ln.strip()
+        }
+        print(f"Patch mode: {len(only_genomes):,} target genomes loaded.", file=sys.stderr)
+
     # Validate tar
     if not args.tar.is_file():
         print(f"ERROR: tar not found: {args.tar}", file=sys.stderr)
@@ -533,9 +607,16 @@ def main() -> None:
     n_written = 0
     class_counts: dict[str, int] = {}
 
-    print(f"\nStreaming {args.tar.name} → {args.output} ...", file=sys.stderr, flush=True)
+    open_mode = "a" if args.append else "w"
+    if args.append:
+        print(
+            f"\nAppending to {args.output} (resume after {args.resume_after}) ...",
+            file=sys.stderr, flush=True,
+        )
+    else:
+        print(f"\nStreaming {args.tar.name} → {args.output} ...", file=sys.stderr, flush=True)
 
-    with args.output.open("w", encoding="utf-8") as out_fh:
+    with args.output.open(open_mode, encoding="utf-8") as out_fh:
         for rec in iter_asdb5_records(
             tar_path=args.tar,
             class_mapping=class_mapping,
@@ -547,6 +628,8 @@ def main() -> None:
             max_length=args.max_length,
             min_length=args.min_length,
             limit=args.limit,
+            resume_after=args.resume_after,
+            only_genomes=only_genomes,
         ):
             out_fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             n_written += 1

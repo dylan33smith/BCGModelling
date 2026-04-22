@@ -1,0 +1,13 @@
+name: bgcmodel
+channels:
+  - https://repo.anaconda.com/pkgs/main
+  - https://repo.anaconda.com/pkgs/r
+dependencies:
+  - antismash[version='>=7.0']
+  - prodigal
+  - pyyaml[version='>=6.0']
+  - bigscape[version='>=2.0']
+  - pip
+  - mmseqs2
+  - pyhmmer[version='>=0.10']
+  - foldseek

@@ -1,5 +1,12 @@
 data/
 
+tmp/
+
+checkpoints/
+
+.claude/
+
 __pycache__/
 *.py[cod]
 .venv/
+*.log
