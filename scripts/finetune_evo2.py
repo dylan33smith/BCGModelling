@@ -3,16 +3,31 @@
 
 Phase 1 conditioning: COMPOUND_CLASS + taxonomic tag, no COMPOUND token.
 
-Launch
+Status
 ------
-    conda activate bgcmodel
-    CUDA_VISIBLE_DEVICES=0,1,2,3 deepspeed --num_gpus=4 scripts/finetune_evo2.py \\
+Smoke-tested on trojai (4× A40, 48 GB each) and OOMs at `optimizer.step()`
+on that hardware. Retained as a reference implementation only.
+
+On the current gputee host (1× H100 PCIe, 80 GB) full-parameter fine-tuning
+still does not fit: bf16 weights (14 GB) + grads (14 GB) + AdamW states
+(56 GB) = 84 GB base, before activations, with no second GPU to shard to.
+Use `finetune_evo2_lora.py` for actual runs. See
+`docs/gputee/FINETUNE_GUIDE.md` §1 for the full memory analysis.
+
+Launch (reference only — script OOMs on single-GPU just as it did on 4× A40)
+---------------------------------------------------------------------------
+    # trojai, for historical record:
+    # CUDA_VISIBLE_DEVICES=0,1,2,3 deepspeed --num_gpus=4 scripts/finetune_evo2.py [...]
+
+    # gputee, single GPU:
+    micromamba activate bgcmodel     # or: conda activate bgcmodel
+    deepspeed --num_gpus=1 scripts/finetune_evo2.py \\
         --train         data/processed/splits_combined/train.jsonl \\
         --val           data/processed/splits_combined/val.jsonl \\
         --output-dir    checkpoints/phase1_classonly \\
         --wandb-project bcg-evo2-phase1
 
-Full documentation: FINETUNE_GUIDE.md in the repo root.
+Full documentation: docs/gputee/FINETUNE_GUIDE.md.
 
 Project design notes this script honours:
   - Phase 1 is class-only. The COMPOUND token has already been stripped from

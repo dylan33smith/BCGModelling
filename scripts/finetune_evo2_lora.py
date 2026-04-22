@@ -3,17 +3,25 @@
 
 Phase 1 conditioning: COMPOUND_CLASS + taxonomic tag, no COMPOUND token.
 
-LoRA vs full fine-tune
-----------------------
-Full fine-tune OOMs on 4× A40 (48 GB) because StripedHyena's long-conv
-filter activations are large (~14 GB at L=1024) and the AdamW optimizer
-states for 6.48B params are ~56 GB total. With LoRA:
-  - Base weights are frozen → no optimizer states for frozen params
-  - Only adapter params are trained (~28 M at rank 16 vs 6.48 B)
-  - AdamW states drop from ~56 GB → ~336 MB
-  - Forward/backward still run through frozen base, so activations are
-    unchanged — but the critical OOM (optimizer.step) is eliminated
-  - Activation checkpointing still recommended for L > 4096
+Why LoRA (not full fine-tune)
+-----------------------------
+A full-parameter fine-tune of Evo2 7B needs at minimum:
+    bf16 weights (14 GB) + grads (14 GB) + AdamW states (56 GB) = 84 GB
+before any activations. That exceeds every single GPU we have or have
+had access to:
+  - trojai (4× A40 48 GB): the 84 GB base is only reachable by sharding
+    optimizer + grads via DeepSpeed ZeRO-2 across 4 ranks. Smoke testing
+    showed StripedHyena activations (~14 GB at L=1024) still push each
+    rank over the 46 GB A40 budget on `optimizer.step()`. Details in
+    `docs/trojai/FINETUNE_GUIDE.md` §12.
+  - gputee (1× H100 80 GB): there is no second GPU to shard to. 84 GB
+    > 80 GB even before activations.
+
+LoRA eliminates the optimizer-state term entirely: frozen base weights
+carry no grads and no optimizer state, and the ~28 M adapter params
+need only ~336 MB of AdamW state total. Forward/backward still run
+through the frozen base (so activation memory is unchanged), but the
+critical OOM point (`optimizer.step()`) goes away.
 
 LoRA targets (all nn.Linear layers in Evo2):
   - Attention blocks (every ~8th of 32): Wqkv, out_proj
@@ -28,15 +36,21 @@ Trainable parameter budget (r=16):
 
 Launch
 ------
-    conda activate bgcmodel
-    CUDA_VISIBLE_DEVICES=0,1,2,3 deepspeed --num_gpus=4 \\
+    # gputee, single H100:
+    micromamba activate bgcmodel     # or: conda activate bgcmodel
+    deepspeed --num_gpus=1 \\
         scripts/finetune_evo2_lora.py \\
         --train         data/processed/splits_combined/train.jsonl \\
         --val           data/processed/splits_combined/val.jsonl \\
         --output-dir    checkpoints/phase1_lora \\
+        --grad-accum    32                        \\
         --wandb-project bcg-evo2-phase1
 
-Full documentation: FINETUNE_GUIDE.md §12.
+Note on `--grad-accum`: the default (8) was chosen for world_size=4 to
+give an effective batch of 128. On a single GPU set `--grad-accum 32`
+to keep the same effective batch. See docs/gputee/FINETUNE_GUIDE.md §4.
+
+Full documentation: docs/gputee/FINETUNE_GUIDE.md §12.
 
 Project design notes:
   - Phase 1 is class-only. COMPOUND token stripped during merge step.
