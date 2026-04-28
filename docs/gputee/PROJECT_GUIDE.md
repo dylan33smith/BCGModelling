@@ -1,6 +1,6 @@
 # BGC Modelling — Project Guide (gputee)
 
-*Living document — last updated 2026-04-22 (trojai → gputee migration pass).*
+*Living document — last updated 2026-04-28 (production-readiness cleanup).*
 
 This document is the single reference for understanding, running, and extending the
 de novo BGC generation pipeline built on Evo2. It covers what has been built, how
@@ -1339,14 +1339,91 @@ detectable before HPLC.
 
 | Task                                            | Prerequisites                    | Notes                                                                        |
 | ----------------------------------------------- | -------------------------------- | ---------------------------------------------------------------------------- |
-| **⭐ NEXT on gputee: single-GPU LoRA smoke benchmark** | `finetune_evo2_lora.py` ✅ + `bgcmodel` env created on gputee | Before any production decision, re-run the 10-step smoke test on 1× H100 80 GB (`deepspeed --num_gpus=1 … --max-steps 10 --max-seq-len 1024 --batch-size 1 --grad-accum 1`). Record peak GPU mem at L=1024, 4096, 8192, and 32768. The A40-era memory numbers in FINETUNE_GUIDE.md §4 are not valid on this hardware and the activation-checkpointing decision depends on the new measurements. |
-| Per-block activation checkpointing (conditional) | H100 smoke benchmark             | Whether this is still required on gputee depends on the above benchmark. At L=32 768 the StripedHyena `compute_filter` tensor is ~14 GB × (L / 1024) — large but not necessarily fatal on an 80 GB H100 with LoRA (frozen base + tiny adapter state leaves most of the 80 GB budget for activations). Implement only if the benchmark shows OOM at the target L. |
-| Fine-tune Evo2 7B                               | Combined splits ✅ + smoke benchmark ⬆ | Do NOT launch at L ≤ 8192 — core biosynthetic domains are past the truncation point for most BGCs. Target L=32 768. Use `--grad-accum 32` on gputee to preserve the original 128-sequence effective batch from the 4× A40 defaults. |
+| **⭐ NEXT on gputee: optional midpoint bracketing (`L=73728 81920 90112`)** | Long-L probe ✅ | Completed padded long-L probe (`queued_smoke_20260426_185444`): `L=49152` pass at 59.44 GB, `L=65536` pass at 74.11 GB, `L=98304` OOM. Ceiling is bracketed between 65k and 98k. Midpoint sweep is only needed if we want a tighter upper bound before choosing between 32k and 65k for production. |
+| Per-block activation checkpointing **(implemented + validated 2026-04-26)** | — | Implemented in `scripts/finetune_evo2_lora.py::enable_block_activation_checkpointing()` and now default-on (explicit opt-out via `--no-activation-checkpointing`). Validation sweep shows major memory reduction and successful `L=32768` smoke pass. Keep using `use_reentrant=False` because `--lora-dropout` is non-zero. Details and logs in `FINETUNE_GUIDE.md` §12.7. |
+| Fine-tune Evo2 7B                               | Combined splits ✅ + smoke decisions ✅ | `L=32768` is now a well-supported conservative default on gputee with AC. `L=65536` is feasible in smoke runs but near memory limits; treat as stretch target pending a production-like preflight. Keep `--grad-accum 32` on gputee to preserve the original 128-sequence effective batch from the 4× A40 defaults. |
 | Generate BGC sequences                          | Fine-tuned model                 | Condition on target class + E. coli taxonomy tag                             |
 | Full 8-metric evaluation of generated sequences | Generated sequences + restored NPAtlas + UniRef50 (§4.1) | All 8 metrics operational; main project deliverable. M5/M8 blocked on the two missing data directories. |
 | Test BiG-SCAPE metric (M6) end-to-end           | antiSMASH DBs installed          | Needs GenBank output from M1; structural novelty scoring                     |
 | Identify wet lab collaborator                   | —                                | Parallel track; not blocking computational work                              |
 
+
+### 13.1  Production run scaffolding (start now; final `L` can remain pending)
+
+The only open training decision is final `--max-seq-len` (`32768` conservative
+vs `65536` stretch). Everything else should be prepared now so launch is a
+single switch flip once preflight resolves.
+
+Scaffolding is now concretely defined:
+
+1. **Run directory convention (fixed):**
+   - `/data2/ds85/bgcmodel_runs/phase1_lora_prod_<YYYYmmdd_HHMMSS>_L<LEN>/`
+   - Required artefacts: `config.json`, `deepspeed_config.json`,
+     `train_log.jsonl`, `checkpoints/`, `final_adapter/`.
+
+2. **Decision gate (codified):**
+   - Use `L=65536` only if the **queued production-like preflight** is clean
+     (idle-gpu gated launch, padded collation, stable multi-step window,
+     no OOM).
+   - Otherwise use `L=32768`.
+
+3. **Launch templates prepared (only `--max-seq-len` differs):**
+
+```bash
+# Template A (conservative): L=32768
+deepspeed --num_gpus=1 scripts/finetune_evo2_lora.py \
+  --train data/processed/splits_combined/train.jsonl \
+  --val data/processed/splits_combined/val.jsonl \
+  --output-dir /data2/ds85/bgcmodel_runs/phase1_lora_prod_<TS>_L32768 \
+  --max-seq-len 32768 --grad-accum 32
+
+# Template B (stretch): L=65536
+deepspeed --num_gpus=1 scripts/finetune_evo2_lora.py \
+  --train data/processed/splits_combined/train.jsonl \
+  --val data/processed/splits_combined/val.jsonl \
+  --output-dir /data2/ds85/bgcmodel_runs/phase1_lora_prod_<TS>_L65536 \
+  --max-seq-len 65536 --grad-accum 32
+```
+
+4. **Restart SOP (documented):**
+   - On interruption/OOM, inspect latest checkpoint directory under
+     `checkpoints/`.
+   - Resume with:
+     `--resume-from /data2/.../checkpoints/step_<N>`
+   - Keep all non-length hyperparameters unchanged across restart.
+   - If `L=65536` repeatedly OOMs in production-like conditions, fall back to
+     `L=32768` and relaunch from step 0 (treat as a new run config).
+
+5. **Operational guardrails:**
+   - Launch from tmux only.
+   - Use queued scripts on shared GPU when possible:
+     - smoke: `scripts/queue_h100_smoke.sh`
+     - production-like preflight: `scripts/queue_h100_preflight.sh`
+
+### 13.2  Data and evaluation readiness (start now; independent of final `L`)
+
+Use this as the gating checklist before calling a run "deliverable-ready".
+
+Status summary (from `readiness.json`, refreshed 2026-04-28 in `bgcmodel` env):
+
+| Item | Status | Notes |
+| --- | --- | --- |
+| Combined train/val/test JSONL | ✅ Ready | `data/processed/splits_combined/` present |
+| antiSMASH runtime DBs (Metric 1) | ✅ Ready | `download-antismash-databases` command available in env |
+| Pfam-A.hmm (Metric 2) | ✅ Ready | `data/pfam/Pfam-A.hmm` present |
+| ESMFold stack (Metric 3) | ✅ Ready | previously validated; re-check in current env if needed |
+| NPAtlas (Metric 5 + optional COMPOUND conditioning prep) | ✅ Ready | `data/npatlas/NPAtlas_download.json` present |
+| antiSMASH DB v5 source tar (reprocessing only) | ❌ Missing | not required if using migrated JSONL |
+| UniRef50 MMseqs DB (Metric 8) | ✅ Ready | `data/uniref50/uniref50` present |
+
+Immediate readiness actions:
+
+1. Run `scripts/check_data_eval_readiness.py --json > readiness.json` before
+   each production launch and archive a timestamped copy.
+2. Current archived snapshot:
+   - `docs/gputee/readiness_snapshots/readiness_20260428_104336.json`
+3. Keep the readiness snapshot alongside launch metadata for every production
+   run so data/command drift is auditable.
 
 ### Completed (cumulative)
 
@@ -1375,10 +1452,54 @@ detectable before HPLC.
 ### Future enhancements
 
 - 40B Evo2 checkpoint (requires multi-H100 setup)
-- Activation checkpointing at StripedHyena block level (needed for L > 4096 training)
+- Activation checkpointing at StripedHyena block level — see `FINETUNE_GUIDE.md`
+  §12.7 for the full mechanical description, compute cost (~1.33× step time),
+  and `use_reentrant=False` requirement. Demoted from "required" to "conditional"
+  on the gputee H100 smoke benchmark; also the enabling mechanism for any
+  train-time `L > 32,768` experiment (see next bullet).
 - Increase LoRA rank to 32–64 if val loss plateaus early in production run
 - Additional compound classes when antiSMASH data available
 - Codon-optimised MIBiG training variants (if M7 shows poor E. coli compatibility)
+
+#### Open options for handling the >32,768 bp sequence tail (not adopted decisions)
+
+Background: the current training plan caps `--max-seq-len` at 32,768 and
+centre-crops the ~17% of records longer than that (see `FINETUNE_GUIDE.md` §3
+for the full caveats — flanking genes discarded, val/test computed on the same
+crop, train/inference length mismatch). The plan currently addresses this tail
+with a single strategy (centre-crop) and has no branch for revisiting it. The
+options below are candidates to evaluate; none is currently committed to.
+
+- **Long-context held-out evaluation.** Define a validation subset of records
+  with full length ≥ 50 kb and a metric that scores the model's behaviour on
+  the flanks (e.g. perplexity computed on held-out flank regions). This is a
+  pre-requisite for all of the strategies below — without it there is no
+  signal to distinguish them.
+- **Random-window-per-epoch.** Instead of a fixed centre crop, draw a random
+  32 k window from each >32 k record each epoch. Preserves train-time L (and
+  therefore the §12.7 memory budget) while exposing the flanks over multiple
+  epochs. Trade-off: validation loss becomes noisier unless val uses a fixed
+  window; some evaluation protocol changes required.
+- **Multi-chunk per record.** Slice each >32 k record into multiple
+  non-overlapping (or overlapping) 32 k chunks and emit each as a separate
+  training sample. Increases step count per epoch roughly in proportion to
+  the mean-length-over-32 k ratio (maybe ~1.3–1.5×); otherwise preserves the
+  §12.7 memory budget.
+- **Curriculum L.** Train early epochs at a small L (e.g. 8 k or 16 k) and
+  raise L over training. Memory/throughput friendly; only addresses the tail
+  if the final L is ≥ the desired cap.
+- **Push L past 32,768 under block-level activation checkpointing.** If the
+  §12.7 benchmark shows the H100 has headroom at L = 32 768, use block-level
+  activation checkpointing to trade ~1.33× step time for the memory needed to
+  reach L = 65,536 or 131,072. The 95th percentile is ~124 kb, so L = 131,072
+  would bring full-length coverage from 83% to nearly 100%. This is a
+  non-trivial change (longer steps, longer per-step wall clock, bigger data
+  pipeline buffers) and the §12.7 decision rule currently doesn't have a
+  branch for it — it would need to be added.
+
+Any of these should be evaluated against the long-context held-out metric
+(first bullet) before being adopted, and should reference the §12.7 memory
+measurements so the memory/compute cost is explicit in the decision record.
 
 ---
 
@@ -1460,6 +1581,19 @@ PYTHONPATH=src python scripts/evaluate_bgc.py \
 PYTHONPATH=src python scripts/eval_smoke.py \
   --jsonl data/processed/splits/test.jsonl \
   --max-sequences 5
+
+# Queued H100 LoRA smoke matrix (waits for GPU idle, then runs L=1024..32768)
+# Results: /data2/ds85/bgcmodel_runs/queued_smoke_<timestamp>/summary.tsv
+scripts/queue_h100_smoke.sh
+
+# Queued production-like preflight sweep (waits for idle GPU; grad_accum=32 defaults)
+# Results: /data2/ds85/bgcmodel_runs/queued_preflight_<timestamp>/summary.tsv
+scripts/queue_h100_preflight.sh
+
+# Data/eval readiness report (paths + command availability)
+python scripts/check_data_eval_readiness.py
+# JSON format (for artifact logging):
+python scripts/check_data_eval_readiness.py --json
 
 # Evaluate a generated FASTA
 PYTHONPATH=src python scripts/evaluate_bgc.py \

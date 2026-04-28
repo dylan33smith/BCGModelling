@@ -4,6 +4,8 @@ tmp/
 
 checkpoints/
 
+figures/
+
 .claude/
 
 __pycache__/

@@ -36,19 +36,27 @@ Trainable parameter budget (r=16):
 
 Launch
 ------
-    # gputee, single H100:
-    micromamba activate bgcmodel     # or: conda activate bgcmodel
+    # gputee, single H100 — note output-dir on /data2 (/home is tight)
+    micromamba activate bgcmodel
+    export HF_HOME=/data2/ds85/hf_cache
     deepspeed --num_gpus=1 \\
         scripts/finetune_evo2_lora.py \\
         --train         data/processed/splits_combined/train.jsonl \\
         --val           data/processed/splits_combined/val.jsonl \\
-        --output-dir    checkpoints/phase1_lora \\
+        --output-dir    /data2/ds85/bgcmodel_runs/phase1_lora \\
         --grad-accum    32                        \\
         --wandb-project bcg-evo2-phase1
 
-Note on `--grad-accum`: the default (8) was chosen for world_size=4 to
-give an effective batch of 128. On a single GPU set `--grad-accum 32`
-to keep the same effective batch. See docs/gputee/FINETUNE_GUIDE.md §4.
+Notes:
+  - `--grad-accum`: default (8) targets world_size=4 for an effective batch
+    of 128. On a single H100 use `--grad-accum 32` to keep effective batch
+    at 128. See docs/gputee/FINETUNE_GUIDE.md §4.
+  - `--output-dir` on `/data2`: on gputee `/home` is near-full (~30 GB free
+    as of 2026-04-22). Checkpoints, samples, offline wandb logs, and plots
+    all go under the output dir. `/data2` has ~1.5 TB free. See
+    docs/gputee/FINETUNE_GUIDE.md §2 (storage layout).
+  - Checkpoints exclude frozen base-model weights (~25 GB/ckpt that would
+    otherwise be redundant with the HF cache). See §11 of the guide.
 
 Full documentation: docs/gputee/FINETUNE_GUIDE.md §12.
 
@@ -70,6 +78,8 @@ import json
 import math
 import os
 import random
+from functools import partial
+import shutil
 import signal
 import subprocess
 import sys
@@ -158,6 +168,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lora-targets", type=str, nargs="+",
                    default=LORA_TARGET_MODULES,
                    help="Linear module name suffixes to add LoRA adapters to")
+    ac = p.add_mutually_exclusive_group()
+    ac.add_argument("--activation-checkpointing", dest="activation_checkpointing",
+                    action="store_true",
+                    help="Enable block-level activation checkpointing "
+                         "(default: enabled).")
+    ac.add_argument("--no-activation-checkpointing", dest="activation_checkpointing",
+                    action="store_false",
+                    help="Disable block-level activation checkpointing.")
+    p.set_defaults(activation_checkpointing=True)
+    p.add_argument("--smoke-pad-to-max-seq-len", action="store_true",
+                   help="For train batches only: pad every micro-batch to a fixed "
+                        "length of --max-seq-len (pad token + ignored labels on "
+                        "padding). Use for GPU memory sweeps so peak memory reflects "
+                        "the requested L even when dataset samples are shorter. "
+                        "Validation still uses natural-length collation.")
     p.add_argument("--max-steps",  type=int, default=0,
                    help="If >0, stop after this many optimizer steps (smoke tests)")
     p.add_argument("--resume-from", type=Path, default=None,
@@ -285,17 +310,49 @@ class BGCTextDataset(Dataset):
 
 
 def collate_pad(batch: list[dict[str, Any]],
-                pad_id: int = PAD_TOKEN_ID) -> dict[str, torch.Tensor]:
-    max_len = max(b["length"] for b in batch)
+                pad_id: int = PAD_TOKEN_ID) -> dict[str, Any]:
+    content_max = max(b["length"] for b in batch)
     B = len(batch)
-    input_ids = torch.full((B, max_len), pad_id, dtype=torch.long)
-    labels    = torch.full((B, max_len), IGNORE_INDEX, dtype=torch.long)
+    input_ids = torch.full((B, content_max), pad_id, dtype=torch.long)
+    labels    = torch.full((B, content_max), IGNORE_INDEX, dtype=torch.long)
     for i, b in enumerate(batch):
         L   = b["length"]
         ids = torch.tensor(b["input_ids"], dtype=torch.long)
         input_ids[i, :L] = ids
         labels[i, :L]    = ids
-    return {"input_ids": input_ids, "labels": labels}
+    return {
+        "input_ids":     input_ids,
+        "labels":        labels,
+        "content_max_len": content_max,
+    }
+
+
+def collate_pad_to_max(batch: list[dict[str, Any]], max_seq_len: int,
+                       pad_id: int = PAD_TOKEN_ID) -> dict[str, Any]:
+    """Pad every row to `max_seq_len` tokens (train memory sweeps).
+
+    Dataset items are already truncated to <= max_seq_len. Padding tail
+    uses `pad_id`; labels on padded positions are IGNORE_INDEX so loss
+    does not train on filler tokens.
+    """
+    content_max = max(b["length"] for b in batch)
+    if content_max > max_seq_len:
+        raise ValueError(
+            f"collate_pad_to_max: content_max={content_max} > max_seq_len={max_seq_len}"
+        )
+    B = len(batch)
+    input_ids = torch.full((B, max_seq_len), pad_id, dtype=torch.long)
+    labels    = torch.full((B, max_seq_len), IGNORE_INDEX, dtype=torch.long)
+    for i, b in enumerate(batch):
+        L   = b["length"]
+        ids = torch.tensor(b["input_ids"], dtype=torch.long)
+        input_ids[i, :L] = ids
+        labels[i, :L]    = ids
+    return {
+        "input_ids":       input_ids,
+        "labels":          labels,
+        "content_max_len": content_max,
+    }
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -451,6 +508,80 @@ def apply_lora(model: torch.nn.Module, args: argparse.Namespace,
 
 
 # ────────────────────────────────────────────────────────────────────────
+# Block-level activation checkpointing
+# ────────────────────────────────────────────────────────────────────────
+
+def _find_stripedhyena(model: torch.nn.Module) -> torch.nn.Module:
+    """Locate the underlying StripedHyena instance (the one that owns
+    `.blocks`) underneath any peft / DeepSpeed wrappers.
+
+    Walks a small set of well-known wrapper attributes and stops at the
+    first module that exposes a `.blocks` attribute. Raises if it can't
+    find one — we'd rather fail loudly than silently no-op.
+    """
+    candidates: list[torch.nn.Module] = [model]
+    visited: set[int] = set()
+    # Common wrapper attribute paths we may need to drill through:
+    #   PeftModel.base_model.model
+    #   LoraModel.model
+    #   DeepSpeedEngine.module
+    while candidates:
+        m = candidates.pop(0)
+        if id(m) in visited:
+            continue
+        visited.add(id(m))
+        if hasattr(m, "blocks") and isinstance(getattr(m, "blocks"), torch.nn.ModuleList):
+            return m
+        for attr in ("module", "base_model", "model"):
+            if hasattr(m, attr):
+                child = getattr(m, attr)
+                if isinstance(child, torch.nn.Module):
+                    candidates.append(child)
+    raise RuntimeError(
+        "Could not locate a module with a `.blocks: nn.ModuleList` attribute. "
+        "Activation checkpointing requires access to the StripedHyena block list."
+    )
+
+
+def enable_block_activation_checkpointing(model: torch.nn.Module) -> int:
+    """Wrap each StripedHyena block's `forward` with
+    `torch.utils.checkpoint.checkpoint(..., use_reentrant=False)`.
+
+    Why use_reentrant=False:
+      - The legacy reentrant variant does not forward keyword arguments
+        (block forward takes `padding_mask=` and `inference_params=`).
+      - With LoRA dropout active, the recompute on backward must replay
+        the same RNG state; the non-reentrant variant snapshots/restores
+        RNG correctly.
+      - It is also the API direction PyTorch is moving toward.
+
+    Returns the number of blocks wrapped.
+
+    Note: we override `forward` on the block instance. `nn.Module.__call__`
+    looks up `self.forward` via normal attribute resolution, so the instance
+    attribute shadows the class method. peft only rewrites inner Linear
+    modules and never touches the block list, so this stays valid through
+    LoRA application. DeepSpeed's wrapping happens above this layer and
+    does not interpose on per-block forward.
+    """
+    from torch.utils.checkpoint import checkpoint
+
+    sh = _find_stripedhyena(model)
+    n_wrapped = 0
+    for block in sh.blocks:
+        original_forward = block.forward  # bound method on this block instance
+
+        def make_checkpointed(orig):
+            def checkpointed_forward(*args, **kwargs):
+                return checkpoint(orig, *args, use_reentrant=False, **kwargs)
+            return checkpointed_forward
+
+        block.forward = make_checkpointed(original_forward)
+        n_wrapped += 1
+    return n_wrapped
+
+
+# ────────────────────────────────────────────────────────────────────────
 # Checkpoint helpers  (LoRA-specific: save adapter + DS state separately)
 # ────────────────────────────────────────────────────────────────────────
 
@@ -462,9 +593,16 @@ def save_lora_checkpoint(model_engine, args: argparse.Namespace,
     ckpt_dir = ckpt_root / tag
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. DeepSpeed checkpoint — saves ZeRO-2 optimizer shards across all ranks
+    # 1. DeepSpeed checkpoint — saves scheduler + client_state and ZeRO-2
+    #    optimizer shards for the LoRA-trainable params only. Frozen base
+    #    model weights are intentionally excluded: they are already on disk
+    #    in the HF cache (evo2_7b.pt, ~14 GB) and are reloaded on every
+    #    run via Evo2("evo2_7b"). Re-serialising them into
+    #    mp_rank_00_model_states.pt would add ~25 GB per checkpoint for
+    #    no resume-time benefit. See docs/gputee/FINETUNE_GUIDE.md §11.
     model_engine.save_checkpoint(str(ckpt_root), tag=tag,
-                                 client_state=client_state)
+                                 client_state=client_state,
+                                 exclude_frozen_parameters=True)
 
     # 2. peft adapter weights — rank 0 only (ZeRO-2 keeps full weights on each rank)
     if is_main():
@@ -711,6 +849,18 @@ def main() -> None:
     else:
         model = apply_lora(model, args)
 
+    # ── Optional block-level activation checkpointing ─────────────────
+    # See docs/gputee/FINETUNE_GUIDE.md §12.7. Default-on; opt out via
+    # `--no-activation-checkpointing`.
+    if args.activation_checkpointing:
+        n_wrapped = enable_block_activation_checkpointing(model)
+        rank0_print(
+            f"  Activation checkpointing ENABLED: wrapped {n_wrapped} blocks "
+            f"(use_reentrant=False)"
+        )
+    else:
+        rank0_print("  Activation checkpointing: disabled")
+
     # ── Datasets ──────────────────────────────────────────────────────
     rank0_print("Indexing datasets...")
     train_ds = BGCTextDataset(args.train, tokenizer, args.max_seq_len)
@@ -722,9 +872,18 @@ def main() -> None:
     val_sampler   = DistributedSampler(val_ds,   num_replicas=world_size,
                                        rank=ddp_rank(), shuffle=False)
 
+    if args.smoke_pad_to_max_seq_len:
+        train_collate = partial(collate_pad_to_max, max_seq_len=args.max_seq_len)
+        rank0_print(
+            f"  Train collation: pad every micro-batch to --max-seq-len={args.max_seq_len} "
+            f"(smoke memory sweep; val still natural-length)"
+        )
+    else:
+        train_collate = collate_pad
+
     train_loader = DataLoader(
         train_ds, batch_size=args.batch_size, sampler=train_sampler,
-        collate_fn=collate_pad, num_workers=2, pin_memory=True, drop_last=True,
+        collate_fn=train_collate, num_workers=2, pin_memory=True, drop_last=True,
     )
     val_loader = DataLoader(
         val_ds, batch_size=args.batch_size, sampler=val_sampler,
@@ -783,8 +942,10 @@ def main() -> None:
             rank0_print(f"── Epoch {epoch+1}/{args.max_epochs} ──")
 
             for micro_step, batch in enumerate(train_loader):
+                content_max_len = batch.pop("content_max_len", None)
                 input_ids = batch["input_ids"].to(local_rank, non_blocking=True)
                 labels    = batch["labels"].to(local_rank, non_blocking=True)
+                collated_seq_len = int(input_ids.shape[1])
 
                 logits, _ = model_engine(input_ids)
                 loss = causal_lm_loss(logits, labels)
@@ -832,6 +993,9 @@ def main() -> None:
                                 "gpu_mem_gb":     [round(x, 2) for x in gpu_memory_gb()],
                                 "tokens_per_sec": int(tps),
                                 "elapsed_sec":    int(time.time() - t0),
+                                "collated_seq_len": collated_seq_len,
+                                "content_max_len": int(content_max_len)
+                                if content_max_len is not None else collated_seq_len,
                             }
                             append_jsonl(train_log_path, entry)
                             if wandb_run:
@@ -942,10 +1106,22 @@ def main() -> None:
                     model_engine, args, ckpt_root, f"step_{step}_final",
                     {"step": step, "best_val_loss": best_val_loss})
                 if is_main():
-                    # Export a clean merged-free adapter at the top level for easy loading
+                    # Clean peft-format adapter at <output_dir>/final_adapter/
+                    # is the documented load path (docs/gputee/FINETUNE_GUIDE.md §11).
+                    # save_lora_checkpoint already wrote the same bytes under
+                    # checkpoints/step_N_final/adapter/ via peft's save_pretrained,
+                    # so we copy that tree rather than re-serialising through peft.
                     final_adapter = args.output_dir / "final_adapter"
-                    model_engine.module.save_pretrained(str(final_adapter))
-                    rank0_print(f"Final adapter exported → {final_adapter}")
+                    src_adapter   = ckpt_root / f"step_{step}_final" / "adapter"
+                    if src_adapter.exists():
+                        if final_adapter.exists():
+                            shutil.rmtree(final_adapter)
+                        shutil.copytree(src_adapter, final_adapter)
+                        rank0_print(f"Final adapter exported → {final_adapter}")
+                    else:
+                        rank0_print(
+                            f"WARNING: expected adapter at {src_adapter} but it "
+                            "does not exist; skipping final_adapter export")
             except Exception as e:
                 rank0_print(f"Final checkpoint/export failed: {e}")
             if is_main():

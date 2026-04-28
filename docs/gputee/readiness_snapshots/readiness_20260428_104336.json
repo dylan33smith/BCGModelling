@@ -1,0 +1,51 @@
+{
+  "repo_root": "/home/ds85/projects/BCGModelling",
+  "files": {
+    "combined_train": {
+      "path": "/home/ds85/projects/BCGModelling/data/processed/splits_combined/train.jsonl",
+      "required": "yes",
+      "status": "ready"
+    },
+    "combined_val": {
+      "path": "/home/ds85/projects/BCGModelling/data/processed/splits_combined/val.jsonl",
+      "required": "yes",
+      "status": "ready"
+    },
+    "combined_test": {
+      "path": "/home/ds85/projects/BCGModelling/data/processed/splits_combined/test.jsonl",
+      "required": "yes",
+      "status": "ready"
+    },
+    "pfam_hmm": {
+      "path": "/home/ds85/projects/BCGModelling/data/pfam/Pfam-A.hmm",
+      "required": "yes",
+      "status": "ready"
+    },
+    "npatlas_json": {
+      "path": "/home/ds85/projects/BCGModelling/data/npatlas/NPAtlas_download.json",
+      "required": "optional",
+      "status": "ready"
+    },
+    "uniref50_db_dir": {
+      "path": "/home/ds85/projects/BCGModelling/data/uniref50/uniref50",
+      "required": "optional",
+      "status": "ready"
+    },
+    "antismash_db_v5_tar": {
+      "path": "/home/ds85/projects/BCGModelling/data/antismash_db/asdb5_gbks.tar",
+      "required": "optional",
+      "status": "missing"
+    },
+    "antismash_taxa_json": {
+      "path": "/home/ds85/projects/BCGModelling/data/antismash_db/asdb5_taxa.json.gz",
+      "required": "yes",
+      "status": "ready"
+    }
+  },
+  "commands": {
+    "download-antismash-databases": true,
+    "mmseqs": true,
+    "deepspeed": true,
+    "python": true
+  }
+}

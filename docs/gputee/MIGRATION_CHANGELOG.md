@@ -374,13 +374,188 @@ under the new folder layout.
 
 ---
 
+## Post-migration findings (surfaced during first gputee run, 2026-04-22)
+
+These entries document changes made **after** the initial migration pass
+above, during the first attempt to build the env and run the smoke
+benchmark on gputee. All are "fixes to things we didn't know were
+broken until we ran it", not new features.
+
+### 21. Environment-install procedure documented in FINETUNE_GUIDE §2
+
+**Change:** Rewrote §2 ("Required installations") to include the
+working fresh-install sequence: (a) run `micromamba env create -f
+environment.yml` (conda side succeeds, pip side crashes — expected),
+(b) pip install torch alone with the cu124 index-url, (c) pip install
+the prebuilt flash-attn wheel from Dao-AILab's GitHub releases,
+(d) rerun `micromamba env update -n bgcmodel -f environment.yml` to
+install the rest of the pip list, (e) pip install the three
+training-only deps (deepspeed, peft, wandb) that aren't in the env
+file.
+
+**Why:** `environment.yml` lists both `torch==2.5.1+cu124` and
+`flash-attn==2.7.4.post1` in the same pip block. pip resolves the
+whole block before installing anything, and flash-attn's `setup.py`
+does `import torch` at build time, so it crashes with
+`ModuleNotFoundError: No module named 'torch'`. Falling back to
+pip's "build from source" path then hits a second bug (EXDEV on
+cross-filesystem `os.rename` between `/tmp` and the pip cache on
+`/home`, because flash-attn's setup.py uses `os.rename` instead of
+`shutil.move`). Installing the prebuilt wheel sidesteps both.
+
+This is a genuine env-file bug that would also have bitten a fresh
+`conda env create` on trojai if it had ever been recreated. Left
+`environment.yml` itself unchanged (still a valid lock-style export);
+only documented the manual sequence. Updating the yaml would involve
+removing `flash-attn` from the pip list and adding an install-order
+hook, which is more invasive than the doc fix warrants.
+
+**Files:** `docs/gputee/FINETUNE_GUIDE.md` §2 (rewritten).
+
+### 22. `HF_HOME=/data2/ds85/hf_cache` — cache off /home
+
+**Change:** Documented the `HF_HOME` environment variable pointing at
+`/data2/ds85/hf_cache` as a required setup step in `FINETUNE_GUIDE.md`
+§2 ("Storage layout on gputee"). Added to every launch command example
+in §6 (`export HF_HOME=...` prefixed before `deepspeed`). Used this
+path for the first Evo2 7B model download on gputee.
+
+**Why:** `/home` on gputee is near-full (~30 GB free). The Evo2 7B
+checkpoint is ~14 GB and HuggingFace typically needs ~2× during
+download for temp files. Downloading into the default
+`~/.cache/huggingface/` would have pushed `/home` to 100% and broken
+the shared server for everyone. `/data2` is a 7 TB XFS volume with
+~1.5 TB free, shared but not disk-constrained.
+
+**Kept unchanged:** the `evo2` library's HF download mechanism itself.
+It already honours `HF_HOME` without modification.
+
+**Files:** `docs/gputee/FINETUNE_GUIDE.md` §2 (new "Storage layout"
+subsection), §6 (three launch command examples updated), §12.7 (smoke
+benchmark loop updated).
+
+### 23. `--output-dir /data2/ds85/bgcmodel_runs/<run_name>` — runs off /home
+
+**Change:** Changed the recommended `--output-dir` path in every
+documented launch command from `checkpoints/phase1_lora` (under the
+repo, on `/home`) to `/data2/ds85/bgcmodel_runs/phase1_lora` (on
+`/data2`). Also updated the top-of-file docstring launch example in
+`scripts/finetune_evo2_lora.py` to use the new path, and explained
+the change in the "Notes" block under that example. No code logic
+changed — `--output-dir` has always been CLI-configurable; this is
+purely the documented default pattern.
+
+**Why:** same `/home` disk pressure as #22, plus training produces
+checkpoints, plots, offline wandb logs, and sample FASTAs under the
+output dir. Even with the checkpoint-size fix (entry #24 below), a
+long run produces hundreds of MB of logs + plots + samples that
+should not compete for the ~30 GB free on `/home`.
+
+**Files:** `docs/gputee/FINETUNE_GUIDE.md` §6 (all three launch
+examples: smoke, production, resume), §11 (path in the file-layout
+diagram), §12.7 (smoke benchmark loop); `scripts/finetune_evo2_lora.py`
+docstring only (no logic change).
+
+### 24. `exclude_frozen_parameters=True` on DeepSpeed checkpoint save
+
+**Change:** Added `exclude_frozen_parameters=True` to the
+`model_engine.save_checkpoint(...)` call inside
+`save_lora_checkpoint` in `scripts/finetune_evo2_lora.py`.
+
+**Why:** The pre-fix save wrote a 25 GB `mp_rank_00_model_states.pt`
+per checkpoint — the full 6.5B Evo2 base weights, serialised at every
+`--save-every` step. With `keep_last_ckpts=5` that was ~127 GB in
+flight for a LoRA run, plus another ~25 GB for the `best/` copy. None
+of those bytes are useful: the frozen base is loaded fresh from the
+HF cache via `Evo2("evo2_7b")` on every run, and the LoRA adapter is
+restored from `checkpoints/step_N/adapter/` via
+`PeftModel.from_pretrained`. The only genuinely useful content in
+`mp_rank_00_model_states.pt` is the scheduler state + client_state
+(step counter, best_val_loss), which is a few KB.
+
+Post-fix footprint per checkpoint: ~55 MB adapter + ~330 MB
+ZeRO-partitioned optimizer state + ~few MB model state = ~390 MB.
+A full production run at default retention drops from ~150 GB to
+~3 GB in flight.
+
+**Resume correctness:** unchanged. DeepSpeed handles
+`exclude_frozen_parameters=True` symmetrically on load; the frozen
+base comes from the init path (`Evo2("evo2_7b")`) rather than the
+checkpoint, and the scheduler + trainable-param optimizer state still
+round-trip correctly. Manual resume-correctness verification is
+pending (documented in §12.8) and is the last prerequisite before a
+long run.
+
+**Discovery context:** surfaced on the first gputee smoke run when a
+3-step L=1024 benchmark consumed 20 GB of `/home` for
+`checkpoints/smoke_L1024/checkpoints/step_3_final/mp_rank_00_model_states.pt`.
+The fix was reviewed against DeepSpeed's documented semantics for
+LoRA-compatible checkpointing; the flag was added to DeepSpeed for
+exactly this case.
+
+**Files:** `scripts/finetune_evo2_lora.py` (`save_lora_checkpoint`
+function, 1 call-site change + comment);
+`docs/gputee/FINETUNE_GUIDE.md` §11 (file-layout diagram + new size
+table), §12.8 (new section documenting the fix).
+
+### 25. `final_adapter/` is now a copy of `step_N_final/adapter/`
+
+**Change:** In `scripts/finetune_evo2_lora.py`, replaced the
+end-of-training `model_engine.module.save_pretrained(final_adapter)`
+call with `shutil.copytree(checkpoints/step_N_final/adapter,
+final_adapter)`. Added `import shutil`.
+
+**Why:** `save_lora_checkpoint` has already written the adapter to
+`checkpoints/step_N_final/adapter/` (via peft's `save_pretrained`)
+just before this code runs. The pre-fix script immediately re-wrote
+the same bytes to `final_adapter/` via a second, independent peft
+call. Two code paths serialising the same LoRA adapter is a drift
+hazard (version skew in peft's format would produce two inconsistent
+copies). `shutil.copytree` of the already-written bytes guarantees
+identity, and skips the ~1-second overhead of re-serialising through
+peft's internals.
+
+**Trade-off considered:** could have made `final_adapter/` a symlink
+to `step_N_final/adapter/` to save 55 MB of disk. Decided against —
+a user who later trims the `checkpoints/` subtree (common cleanup
+action) would silently break the documented inference-time load path
+(`PeftModel.from_pretrained("…/final_adapter")`). The 55 MB copy is
+negligible on `/data2`.
+
+**Files:** `scripts/finetune_evo2_lora.py` (`import shutil` added,
+final-adapter export block rewritten); `docs/gputee/FINETUNE_GUIDE.md`
+§11 (noted the copytree mechanism).
+
+### 26. LoRA script docstring rewritten (post-fix launch block)
+
+**Change:** Rewrote the top-of-file docstring `Launch` block in
+`scripts/finetune_evo2_lora.py` to reflect the new canonical gputee
+setup: `export HF_HOME=/data2/ds85/hf_cache` before `deepspeed`,
+`--output-dir /data2/ds85/bgcmodel_runs/phase1_lora` instead of the
+old in-repo path, and added a "Notes" block calling out grad-accum,
+output-dir, and the checkpoint-size fix (with cross-reference to
+`docs/gputee/FINETUNE_GUIDE.md` §11). No code logic changed in this
+entry — it is purely a docstring update.
+
+**Why:** keeps `python scripts/finetune_evo2_lora.py --help` and the
+raw module docstring consistent with the guide. The trojai-era
+docstring implicitly assumed 4-GPU via `CUDA_VISIBLE_DEVICES=0,1,2,3`
+and `--num_gpus=4`, which entry #2/C2 in this changelog had already
+flagged as an EDIT.
+
+**Files:** `scripts/finetune_evo2_lora.py` top docstring only.
+
+---
+
 ## Summary of what was intentionally left unchanged
 
 - **All code logic in `scripts/finetune_evo2*.py`** apart from the top
-  docstring. Every bug fix, the per-rank GPU masking, the DS config,
-  the LoRA config, the default hyperparameters, the training loop, the
-  checkpoint machinery, and the plotting code are byte-identical to the
-  trojai version.
+  docstring AND the two post-migration fixes in entries #24–#25 below
+  (the `exclude_frozen_parameters=True` flag on DeepSpeed save, and
+  `final_adapter/` via `shutil.copytree` of the already-saved adapter).
+  Every other bug fix, the per-rank GPU masking, the DS config, the
+  LoRA config, the default hyperparameters, the training loop, and the
+  plotting code are byte-identical to the trojai version.
 - **The DeepSpeed ZeRO-2 config** stays at stage 2 with full sharding knobs.
   At world_size=1 this is a no-op sharding-wise but still provides bf16,
   grad-accum, grad-clip, LR schedule, and the peft-compatible checkpoint
