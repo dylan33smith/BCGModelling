@@ -1488,6 +1488,7 @@ Immediate readiness actions:
 | §13.1 / §13.2 production-run scaffolding codified    | 2026-04-28/29 | Run-directory convention (`/data2/ds85/bgcmodel_runs/phase1_lora_prod_<TS>_L<LEN>/`), launch templates, restart SOP, and operational guardrails fixed in this guide |
 | Production-like preflight sweep (real batch+grad-accum) | 2026-04-29 → 2026-05-01 | 30-hour queued run on real `train.jsonl` with `--batch-size 4 --grad-accum 32 --max-steps 20` per L. All pass: L=40960 (52.16 GB), L=49152 (59.50), L=57344 (66.83), L=61440 (70.50), **L=65536 (74.17 GB)**. Throughput stable at ~3,275 tok/s. Run root: `/data2/ds85/bgcmodel_runs/queued_preflight_20260427_110056` |
 | §13 NEXT retargeted: L=32k pilot on combined splits  | 2026-04-29 | Demoted "midpoint bracketing 73k/81k/90k" to optional; promoted "short L=32768 pilot on `splits_combined/{train,val}.jsonl` with production-like settings" as the gating step before the multi-day full run |
+| Resume-from-checkpoint verified + 4 bugs fixed        | 2026-05-11 | Phase 1→Phase 2 resume test at L=1024: step counter continues correctly (3→5), LR schedule matches, loss within expected range, checkpoint size ~390 MB (frozen params excluded). Fixed 4 bugs: dotdict `to_dict` shim on resume path, `autocast_adapter_dtype=False` for `PeftModel.from_pretrained`, `tensor_parallel` stub module for peft 0.19 + transformers 4.46, `load_module_strict=False` for LoRA-only checkpoints. See `FINETUNE_GUIDE.md` §12.8.1 |
 
 
 ### Future enhancements
