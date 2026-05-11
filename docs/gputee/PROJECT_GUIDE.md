@@ -1,6 +1,7 @@
 # BGC Modelling — Project Guide (gputee)
 
-*Living document — last updated 2026-04-28 (production-readiness cleanup).*
+*Living document — last updated 2026-05-11 (post-preflight; env and
+memory characterisation complete, L=32k pilot is the gating next step).*
 
 This document is the single reference for understanding, running, and extending the
 de novo BGC generation pipeline built on Evo2. It covers what has been built, how
@@ -131,12 +132,19 @@ micromamba activate bgcmodel
 
 The env includes: antiSMASH 8.0.4, pyhmmer, Biopython, PyYAML,
 DNA Chisel, BiG-SCAPE 2.0, MMseqs2, Foldseek, and Prodigal.
-Python version is solver-determined (currently **3.12.13** from the original
-solve; this will be re-solved on first create on gputee).
+Python is **3.12.13** (re-solved on gputee, matches trojai).
 
-As of 2026-04-22 the `bgcmodel` env has **not yet been created on gputee**
-— only the env file was carried over from trojai. Run the create step
-above once before any pipeline or training command.
+> **`environment.yml` alone does not produce a working env on a fresh
+> create.** The pip section lists both `torch==2.5.1+cu124` and
+> `flash-attn==2.7.4.post1` in a single batch; pip resolves the whole
+> batch before installing anything and flash-attn's `setup.py` does
+> `import torch` at build time, so the pip step crashes with
+> `ModuleNotFoundError: No module named 'torch'`. The conda side does
+> finish cleanly. **For the working install sequence on gputee see
+> `FINETUNE_GUIDE.md` §2.**
+
+The `bgcmodel` env was first built on gputee on 2026-04-22 using that
+sequence and has been continuously in use since.
 
 ### 3.2  Download antiSMASH reference databases
 
@@ -178,32 +186,44 @@ pinned stack runs unchanged. Upgrading to a newer torch / flash-attn /
 CUDA wheel is out of scope for the migration pass; see
 `MIGRATION_CHANGELOG.md` for the rationale.
 
-**GPU setup on gputee (to be verified after env creation):**
+**GPU setup on gputee (verified 2026-04-22 onward):**
 
 - 1× NVIDIA H100 PCIe, 80 GB VRAM (81,559 MiB per nvidia-smi)
 - Driver 575.64.03 / CUDA 12.9 runtime
 - Single-GPU fine-tuning: no `CUDA_VISIBLE_DEVICES` tweak needed (leave unset, there is only `cuda:0`)
 - Launcher: `deepspeed --num_gpus=1` (single-GPU DeepSpeed is a thin bf16+grad-accum wrapper at world_size=1)
 - The same GPU is used for inference and evaluation
-- Evo2 7B checkpoint (~14 GB) downloads automatically to `~/.cache/huggingface/` on first use
-- ESMFold 3B checkpoint (~3 GB) downloads automatically on first use
+- Evo2 7B checkpoint (~14 GB) cached at `/data2/ds85/hf_cache/hub/models--arcinstitute--evo2_7b_262k/`
+  (re-download only happens if cache is purged)
+- ESMFold 3B checkpoint (~3 GB) downloads on first use; will also land in `HF_HOME=/data2/ds85/hf_cache`
 
-**Disk pressure on gputee (2026-04-22 snapshot):** `/home` has **74 GiB
-free on 1.8 TB (96% used)**. Evo2 + ESMFold checkpoints alone need ~17 GB
-of HF cache; LoRA training checkpoints add ~2 GB per saved step × retention.
-Clear unused artefacts before launching a training run, and monitor with
-`df -h /home` between checkpoints.
+**Disk layout (2026-05-11 snapshot):**
+
+| Path | Size | Free | Use |
+|---|---:|---:|---|
+| `/home` | 1.8 TB | ~16 GB (100%) | code, env (`~/.local/share/mamba/envs/bgcmodel`), `data/` |
+| `/data2` | 7 TB | ~1.5 TB (79%) | HF cache, all `bgcmodel_runs/` per-run output dirs |
+| `/data` | 7 TB | ~420 GB (95%) | shared overflow option if `/data2` fills |
+
+`/home` is essentially full — keep all new run output on `/data2`
+(documented `--output-dir` pattern: `/data2/ds85/bgcmodel_runs/<run_name>`)
+and ensure `HF_HOME=/data2/ds85/hf_cache` is exported in every shell that
+runs training or evaluation. See `FINETUNE_GUIDE.md` §2 ("Storage layout
+on gputee").
 
 **For reference — archived trojai GPU setup (4× NVIDIA A40):** documented
 in `docs/trojai/PROJECT_GUIDE.md` §3.3.
 
 ### 3.4  UniRef50 for MMseqs2 (Metric 8)
 
+Restored on gputee on 2026-04-28 — `data/uniref50/uniref50` is present
+and confirmed in the readiness snapshot
+(`docs/gputee/readiness_snapshots/readiness_20260428_104336.json`).
+
+If the DB is ever lost and needs rebuilding (~29 GB):
 ```bash
-# Not present on gputee (data/uniref50/ is empty — see §4.1).
-# Run this once after migrating the rest of the stack, but check disk first:
-#   df -h /home      # need ~29 GB free for the DB + transient index
-mmseqs databases UniRef50 data/uniref50/uniref50 tmp/
+# IMPORTANT: write to /data2 if /home is tight
+mmseqs databases UniRef50 /data2/ds85/uniref50/uniref50 /data2/ds85/uniref50/tmp/
 ```
 
 > **Important:** All scripts must be run with `micromamba activate bgcmodel`
@@ -1339,7 +1359,8 @@ detectable before HPLC.
 
 | Task                                            | Prerequisites                    | Notes                                                                        |
 | ----------------------------------------------- | -------------------------------- | ---------------------------------------------------------------------------- |
-| **⭐ NEXT on gputee: optional midpoint bracketing (`L=73728 81920 90112`)** | Long-L probe ✅ | Completed padded long-L probe (`queued_smoke_20260426_185444`): `L=49152` pass at 59.44 GB, `L=65536` pass at 74.11 GB, `L=98304` OOM. Ceiling is bracketed between 65k and 98k. Midpoint sweep is only needed if we want a tighter upper bound before choosing between 32k and 65k for production. |
+| **⭐ NEXT on gputee: `L=32768` pilot on real combined splits** | Smoke + AC ✅; combined JSONL ✅ | Stay on **`--max-seq-len 32768`** for this step. Run a **short pilot** on `data/processed/splits_combined/{train,val}.jsonl` with **production-like settings** (`--batch-size 4`, `--grad-accum 32`, default activation checkpointing, **no** `--smoke-pad-to-max-seq-len`) and enough steps to hit at least one validation and checkpoint path. **Goals:** confirm the stack runs end-to-end on real (variable-length) data, `train_log.jsonl` / `val_log.jsonl` / `config.json` (and related artefacts) contain what we need, and behaviour matches expectations before locking in a multi-day full run. Optional: archive `readiness.json` + run metadata beside the pilot output dir. |
+| Optional: midpoint bracketing (`L=73728 81920 90112`) | Long-L probe ✅ | Completed padded long-L probe (`queued_smoke_20260426_185444`): `L=49152` pass at 59.44 GB, `L=65536` pass at 74.11 GB, `L=98304` OOM. Ceiling is bracketed between 65k and 98k. Only needed if we want a tighter upper bound **before** revisiting stretch `L`; **not** blocking the 32k pilot or a conservative production launch. |
 | Per-block activation checkpointing **(implemented + validated 2026-04-26)** | — | Implemented in `scripts/finetune_evo2_lora.py::enable_block_activation_checkpointing()` and now default-on (explicit opt-out via `--no-activation-checkpointing`). Validation sweep shows major memory reduction and successful `L=32768` smoke pass. Keep using `use_reentrant=False` because `--lora-dropout` is non-zero. Details and logs in `FINETUNE_GUIDE.md` §12.7. |
 | Fine-tune Evo2 7B                               | Combined splits ✅ + smoke decisions ✅ | `L=32768` is now a well-supported conservative default on gputee with AC. `L=65536` is feasible in smoke runs but near memory limits; treat as stretch target pending a production-like preflight. Keep `--grad-accum 32` on gputee to preserve the original 128-sequence effective batch from the 4× A40 defaults. |
 | Generate BGC sequences                          | Fine-tuned model                 | Condition on target class + E. coli taxonomy tag                             |
@@ -1350,9 +1371,15 @@ detectable before HPLC.
 
 ### 13.1  Production run scaffolding (start now; final `L` can remain pending)
 
-The only open training decision is final `--max-seq-len` (`32768` conservative
-vs `65536` stretch). Everything else should be prepared now so launch is a
-single switch flip once preflight resolves.
+**Immediate path:** run the **`L=32768` pilot on combined splits** (§13 table,
+⭐ NEXT) before scaling to the full 2-epoch job. That pilot validates logging,
+checkpoints, validation cadence, and wall-clock on **natural collation**; treat
+stretch `L=65536` and extra preflight only after the pilot is green.
+
+The only open training decision for *full* production is still final
+`--max-seq-len` (`32768` conservative vs `65536` stretch). Everything else
+should be prepared now so launch is a single switch flip once preflight
+resolves (for stretch `L` only).
 
 Scaffolding is now concretely defined:
 
@@ -1447,6 +1474,17 @@ Immediate readiness actions:
 | `contig_edge` annotation of antiSMASH JSONL | 2026-04-15 | Single tar pass via `annotate_contig_edge.py`; 41,065/343,923 = 11.9% edge BGCs; 0 unmatched |
 | `scripts/finetune_evo2.py` written + smoke-tested | 2026-04-15 | Full fine-tune script; DeepSpeed ZeRO-2 + WandB; 3 Evo2↔DS bugs fixed; OOMs at optimizer.step on 4× A40 — use LoRA instead |
 | `scripts/finetune_evo2_lora.py` written + smoke-tested | 2026-04-15 | LoRA script (peft 0.19); r=16, 28.7M trainable params (0.44%); 5 bugs fixed; 23.2 GB peak at L=1024; val loss 1.93→1.89 in 10 steps; pipeline ready to launch |
+| **trojai → gputee migration pass**                  | 2026-04-22 | Docs split into `docs/{trojai,gputee}/`; `bgcmodel` env rebuilt on gputee via the documented install sequence; `HF_HOME=/data2/ds85/hf_cache` and `/data2/ds85/bgcmodel_runs/` adopted as canonical storage; full migration record in `MIGRATION_CHANGELOG.md` entries #1–#26 |
+| LoRA-checkpoint size fix (`exclude_frozen_parameters=True`) | 2026-04-22 | Per-checkpoint disk: ~25.4 GB → ~390 MB. `final_adapter/` rewritten as `shutil.copytree` of `step_N_final/adapter/` to eliminate duplicate peft serialisation. See `FINETUNE_GUIDE.md` §12.8 and `MIGRATION_CHANGELOG.md` #24/#25 |
+| First gputee smoke benchmark sweep (no-AC)          | 2026-04-25 | L=1024 (23.52 GB), L=4096 (47.77), L=8192 (80.10 borderline), L=16384/32768 OOM. Established that no-AC path is unsafe past L=4096. Run root: `/data2/ds85/bgcmodel_runs/queued_smoke_20260423_152219` |
+| Block-level activation checkpointing implemented     | 2026-04-26 | `enable_block_activation_checkpointing()` wraps each of 32 StripedHyena blocks via `torch.utils.checkpoint(..., use_reentrant=False)`; default-on; `--no-activation-checkpointing` is the opt-out flag. `use_reentrant=False` is required because `--lora-dropout=0.05` |
+| AC-enabled smoke benchmark sweep                     | 2026-04-26 | L=1024 (16.35 GB), L=4096 (19.10), L=8192 (22.77), L=16384 (30.10), L=32768 (43.92). All pass with large margin. Run root: `/data2/ds85/bgcmodel_runs/queued_smoke_20260426_142830` |
+| `--smoke-pad-to-max-seq-len` flag                    | 2026-04-26 | Earlier long-L probe (`queued_smoke_20260426_153622`) was invalid: natural collation made shorter samples produce identical memory traces. Padded-collation rerun (`queued_smoke_20260426_185444`) gave real numbers: L=49152 (59.44 GB), L=65536 (74.11), L=98304 OOM |
+| `scripts/queue_h100_smoke.sh` + `queue_h100_preflight.sh` | 2026-04-28 | Shared-host-safe wait-for-GPU-idle wrappers with `--min-free-mib` / `--idle-hold-sec` knobs and machine-readable `summary.tsv` output. Used for every smoke + preflight sweep since |
+| `scripts/check_data_eval_readiness.py` + readiness snapshot | 2026-04-28 | Preflight check that all data + binaries are present for the 8-metric eval; archived snapshot at `docs/gputee/readiness_snapshots/readiness_20260428_104336.json`. All 8 metrics confirmed ready |
+| §13.1 / §13.2 production-run scaffolding codified    | 2026-04-28/29 | Run-directory convention (`/data2/ds85/bgcmodel_runs/phase1_lora_prod_<TS>_L<LEN>/`), launch templates, restart SOP, and operational guardrails fixed in this guide |
+| Production-like preflight sweep (real batch+grad-accum) | 2026-04-29 → 2026-05-01 | 30-hour queued run on real `train.jsonl` with `--batch-size 4 --grad-accum 32 --max-steps 20` per L. All pass: L=40960 (52.16 GB), L=49152 (59.50), L=57344 (66.83), L=61440 (70.50), **L=65536 (74.17 GB)**. Throughput stable at ~3,275 tok/s. Run root: `/data2/ds85/bgcmodel_runs/queued_preflight_20260427_110056` |
+| §13 NEXT retargeted: L=32k pilot on combined splits  | 2026-04-29 | Demoted "midpoint bracketing 73k/81k/90k" to optional; promoted "short L=32768 pilot on `splits_combined/{train,val}.jsonl` with production-like settings" as the gating step before the multi-day full run |
 
 
 ### Future enhancements

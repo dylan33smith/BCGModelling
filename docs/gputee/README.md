@@ -21,6 +21,12 @@ micromamba create -n bgcmodel -f environment.yml
 micromamba activate bgcmodel
 ```
 
-On conda-equipped hosts the equivalent is `conda env create -f environment.yml`.
-See `PROJECT_GUIDE.md` §3 for the full GPU-stack install sequence (pip steps
-after the env is created).
+> **`environment.yml` alone does not produce a working env on a fresh
+> create.** The pip step crashes on `flash-attn` because `torch` is not
+> yet installed when `flash-attn`'s `setup.py` runs `import torch`. The
+> conda side does finish cleanly. See **`FINETUNE_GUIDE.md` §2** for
+> the working install sequence (torch first, prebuilt flash-attn wheel,
+> then re-run `env update`, then deepspeed/peft/wandb).
+
+On conda-equipped hosts the equivalent is `conda env create -f environment.yml`
+(same caveat applies).

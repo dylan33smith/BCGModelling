@@ -1,7 +1,8 @@
 # Evo2 7B Fine-Tuning Guide (gputee)
 
-*Last updated: 2026-04-22 (trojai → gputee migration pass; numbers marked
-"A40" are historical; numbers marked "H100" are pending re-measurement).*
+*Last updated: 2026-05-11 (env + memory characterisation complete on
+gputee; L=32k pilot is the gating next step before the multi-day full
+run).*
 
 Everything needed to fine-tune Evo2 7B on the combined BGC training dataset.
 Covers hardware constraints, hyperparameter rationale, what to log, what to
@@ -9,11 +10,12 @@ watch for, and how to resume from a checkpoint. Read this before starting a run.
 
 **Hardware context:** this copy of the guide is for the `gputee` host
 (1× NVIDIA H100 PCIe, 80 GB). The archived `docs/trojai/FINETUNE_GUIDE.md`
-documents the original 4× NVIDIA A40 analysis. Every number below that
-is marked **(trojai measurement)** comes from the A40 smoke tests; every
-number marked **(gputee, pending)** still needs to be re-measured on the
-H100. Do not take the trojai numbers as load-bearing for any production
-decision.
+documents the original 4× NVIDIA A40 analysis. Numbers marked
+**(trojai)** are from the A40 smoke tests and kept only as historical
+reference. The §4 "Memory at runtime" and §12.7 tables now contain
+measured gputee/H100 numbers under both smoke (batch=1) and
+production-like (batch=4, grad-accum=32) settings — those are the
+load-bearing values.
 
 ---
 
@@ -361,8 +363,10 @@ dict in the scripts themselves is **not** being changed; use the CLI flag.
 
 ### Memory at runtime
 
-Two sub-tables: the first is historical (4× A40, trojai); the second is
-empty until the gputee H100 smoke benchmark runs.
+Three sub-tables — A40 history for context, then the two measured gputee
+sweeps that are now load-bearing. All runs are LoRA `r=16` on Evo2 7B;
+the AC sweep uses the default-on block-level activation checkpointing
+(see §12.7).
 
 **Historical — trojai (4× A40 ZeRO-2, LoRA, batch=1):**
 
@@ -370,26 +374,51 @@ empty until the gputee H100 smoke benchmark runs.
 |---|---:|---|
 | L = 1,024  | **23.2 GB** | ✅ Confirmed in trojai smoke test |
 | L = 4,096  | ~43 GB      | ⚠️ OOM — StripedHyena filter |
-| L = 32,768 | unknown     | ❓ Would require activation checkpointing |
+| L = 32,768 | unknown     | ❓ Required activation checkpointing |
 
-**Pending — gputee (1× H100 80 GB, LoRA, batch=1):**
+**Measured — gputee (1× H100 80 GB, LoRA, smoke: batch=1, grad_accum=1):**
 
-| Sequence length | Peak GPU memory | Status |
-|---|---:|---|
-| L = 1,024  | TBD | ❓ Pending smoke benchmark |
-| L = 4,096  | TBD | ❓ Pending smoke benchmark |
-| L = 8,192  | TBD | ❓ Pending smoke benchmark |
-| L = 32,768 | TBD | ❓ Pending smoke benchmark |
+| L         | No-AC peak | AC-on peak | Notes |
+|-----------|-----------:|-----------:|-------|
+| 1,024     | 23.52 GB   | 16.35 GB   | trojai-comparable at no-AC |
+| 4,096     | 47.77 GB   | 19.10 GB   | no-AC trends linear-ish in L |
+| 8,192     | 80.10 GB ⚠️ | 22.77 GB   | no-AC is at saturation; AC has huge margin |
+| 16,384    | ❌ OOM     | 30.10 GB   | no-AC path fails |
+| 32,768    | ❌ OOM     | **43.92 GB** | project target reachable comfortably with AC |
+| 49,152    | n/a        | 59.44 GB   | padded-collation probe |
+| 65,536    | n/a        | 74.11 GB   | near 80 GB ceiling under smoke; ~+27.8 pp coverage vs 32k |
+| 98,304    | n/a        | ❌ OOM     | `compute_filter()` tried 24 GiB alloc |
 
-Two notes on what to expect from the gputee benchmark:
-1. The 14 GB of replicated bf16 weights that sat on each A40 rank now live
-   on a single GPU once instead of four times. That is *lower* total
-   memory, not higher. Peak at L=1024 on gputee should be materially
-   below 23.2 GB.
-2. The StripedHyena `compute_filter` activation tensor still scales O(L)
-   in the forward pass and is per-block. Whether L=32 768 fits on one
-   80 GB GPU without block-level checkpointing is the open question — the
-   benchmark should answer it.
+Run roots: no-AC `queued_smoke_20260423_152219/`; AC on `queued_smoke_20260426_142830/`;
+padded long-L `queued_smoke_20260426_185444/`. Full per-step detail in §12.7.
+
+**Measured — gputee (1× H100 80 GB, LoRA, production-like:
+`--batch-size 4 --grad-accum 32`, AC on, real `train.jsonl`):**
+
+| L         | Peak GPU mem | Throughput | Notes |
+|-----------|-------------:|-----------:|-------|
+| 40,960    | 52.16 GB     | ~3,475 tok/s | 20 steps; loss stable in 0.74–0.86 band |
+| 49,152    | 59.50 GB     | ~3,275 tok/s | 20 steps |
+| 57,344    | 66.83 GB     | ~3,275 tok/s | 20 steps |
+| 61,440    | 70.50 GB     | ~3,275 tok/s | 20 steps |
+| 65,536    | **74.17 GB** | ~3,275 tok/s | 20 steps; ~6 GB headroom |
+
+Run root: `/data2/ds85/bgcmodel_runs/queued_preflight_20260427_110056/`.
+Summary table: `.../summary.tsv`. **This is the load-bearing evidence
+for L choice in production** because it uses real
+batch-size/grad-accum/collation conditions, not the smoke setup.
+
+Decision-relevant facts:
+1. L=32,768 fits comfortably (43.92 GB peak under smoke; under
+   production-like settings it would scale up but still has ample
+   margin) and is the conservative production default.
+2. L=65,536 is feasible under production-like settings at 74.17 GB
+   (~6 GB of headroom on 80 GB) and is the stretch target.
+3. Block-level activation checkpointing is **required** to reach
+   L≥16,384 — without it the no-AC path fails. AC is default-on in
+   `scripts/finetune_evo2_lora.py` since 2026-04-26.
+4. `expandable_segments` allocator tuning is **not** supported on this
+   host (confirmed by the no-AC OOM trace). Do not rely on it.
 
 ### Steps and time estimate
 
@@ -400,25 +429,29 @@ With `--grad-accum 32` (recommended gputee override):
 2 epochs = ~4,332 steps total
 ```
 
-The step count is unchanged because the effective batch is preserved.
-Wall-clock time, on the other hand, depends on the H100's tokens/sec at
-the chosen L and is **pending re-measurement**. A reasonable a priori
-estimate:
+Wall-clock, using the **measured** production-preflight throughput of
+~3,275 tok/s (AC on, batch=4, grad-accum=32, L=49,152–65,536, see §4
+"Memory at runtime" table 3):
 
-- An H100 is ~2× an A40 in bf16 matmul throughput per GPU.
-- trojai had 4× A40 working in parallel ⇒ ~4× aggregate throughput.
-- gputee has 1× H100 ⇒ ~2× aggregate throughput vs one A40, but ~2×
-  *slower* than four A40s at the same per-step work.
-- Expect the trojai "18–36 hours" estimate to roughly double on gputee,
-  i.e. ~1.5–3 days at target L. Treat this as speculative until the
-  smoke benchmark reports `tokens_per_sec`.
+```
+Tokens per optimizer step = 4 seq × 32 accum × L
+Step time                 ≈ tokens-per-step / 3,275 tok/s
+```
 
-> **If block-level activation checkpointing is enabled** (see §12.7): every
-> checkpointed block costs one extra forward pass during backward. Wrapping all
-> 32 StripedHyena blocks turns a `1F + 1B` step into roughly `2F + 1B`, so
-> expect step wall-clock time to be ~1.33× longer than the unchecked baseline.
-> The step count is unchanged. Fold this factor into the time estimate above if
-> the §12.7 decision rule selects the checkpointed path.
+| L target | Tokens/step | Step time | Total wall-clock (4,332 steps) |
+|----------|-----------:|----------:|--------------------------------|
+| 32,768   | 4.19 M     | ~21.4 min | **~64 hours (~2.7 days)**       |
+| 65,536   | 8.39 M     | ~42.7 min | **~128 hours (~5.3 days)**      |
+
+These are direct extrapolations from the 20-step preflight; they
+ignore validation pauses, checkpoint write time, and any throughput
+drift over a multi-day run. Treat ±20% as the expected uncertainty
+band until a real pilot run measures end-to-end wall-clock at scale.
+
+> **Activation checkpointing overhead is already baked in** to the
+> 3,275 tok/s figure (the preflight was run with AC on). The
+> "1F+1B → 2F+1B" ~1.33× factor is *already inside* the measured
+> throughput; do **not** apply it again on top.
 
 ---
 
@@ -478,43 +511,56 @@ Delete older checkpoints automatically to stay within disk budget (~28 GB/checkp
 
 **Use `finetune_evo2_lora.py`.** The full-parameter script (`finetune_evo2.py`)
 does not fit on gputee's 80 GB H100 (84 GB base budget) and OOM'd on trojai
-(see §12). The LoRA script has passed a full smoke test on trojai
-(4 steps, L=1024, 4× A40, forward+backward+optimizer+checkpoint+WandB all
-confirmed). **No gputee smoke test has been run yet** — §12.7 below is the
-first production task after the environment is rebuilt.
+(see §12). The LoRA script has passed:
 
-> **⚠️ Do not launch a long training run on gputee until the §12.7 smoke
-> benchmark has recorded peak GPU memory at L = 1024, 4096, 8192, 32768.**
-> The old "L=4096 OOMs" finding was measured with ZeRO-2 across 4× A40
-> and does not transfer. On 1× H100 80 GB with LoRA we expect materially
-> more headroom, but the question "does L=32 768 fit without block-level
-> activation checkpointing?" is open until measured. If it does not fit,
-> implement per-block `torch.utils.checkpoint` around the 32 StripedHyena
-> blocks (see §13 NEXT in `PROJECT_GUIDE.md`) before launching.
+- trojai smoke (10 steps, L=1024, 4× A40) — 2026-04-15
+- gputee smoke benchmark sweep, no-AC (L=1024 → 8192) — 2026-04-25
+- gputee smoke benchmark sweep, AC on (L=1024 → 65,536) — 2026-04-26
+- gputee **production-like preflight** (real batch=4, grad-accum=32, AC on,
+  L=40,960 → 65,536, 20 steps each) — 2026-04-29 → 2026-05-01
+
+> **⚠️ Remaining prerequisite before a multi-day production launch:** run
+> a short **L=32,768 pilot on real combined splits** (see
+> `PROJECT_GUIDE.md` §13 NEXT). The preflight above validated memory and
+> throughput but only for 20 steps each L — it never reached the first
+> `--val-every 250` or `--save-every 500` boundary. The pilot is the
+> first end-to-end exercise of the validation cadence, checkpoint write
+> path (with `exclude_frozen_parameters=True`, see §12.8), and
+> resume-from-checkpoint semantics on real data.
 
 ### Pre-flight checks
 
 ```bash
-micromamba activate bgcmodel    # or: conda activate bgcmodel
+micromamba activate bgcmodel
+export HF_HOME=/data2/ds85/hf_cache   # critical — see §2 "Storage layout"
 
-# 1. GPU must be idle
+# 1. GPU must be idle (host is shared)
 nvidia-smi --query-compute-apps=pid,used_gpu_memory,gpu_uuid --format=csv
 # Should return header only. Any resident process > 500 MB on the H100 will
-# eat into the training budget. The gputee host is shared; coordinate with
-# other users before launching.
+# eat into the training budget. For unattended launches use
+# scripts/queue_h100_smoke.sh / scripts/queue_h100_preflight.sh which gate
+# on idleness + free memory before kicking off the trainer.
 
-# 2. Disk space
-df -h /home
-# Need at least 50 GB free (LoRA checkpoints are ~2 GB each, keep_last=5,
-# plus ~17 GB for HF cache if Evo2 and ESMFold weights are not already cached).
-# gputee's /home is tight (96% used as of 2026-04-22) — verify, don't assume.
+# 2. Data + binaries are present
+python scripts/check_data_eval_readiness.py --json > readiness.json
+cat readiness.json
+# Want every "required: yes" entry to show "status: ready" — see
+# docs/gputee/readiness_snapshots/readiness_20260428_104336.json for a
+# reference green snapshot. Archive a fresh snapshot alongside any
+# production launch.
 
-# 3. HF cache
-ls -lh ~/.cache/huggingface/hub 2>/dev/null | head
-# If the Evo2 7B weights (~14 GB) are not there, the first model load
-# will download them. Budget accordingly.
+# 3. Disk space — /data2 is the relevant volume, NOT /home
+df -h /data2 /home
+# Production runs land entirely on /data2 (HF cache + run outputs).
+# /home is essentially full (~16 GB free) and is fine as long as no run
+# output is misrouted to it. /data2 should have hundreds of GB free.
 
-# 4. WandB auth
+# 4. HF cache state
+du -sh /data2/ds85/hf_cache/hub/models--arcinstitute--evo2_7b_262k 2>/dev/null
+# Expect ~13–14 GB. If empty, the first model load will download it
+# (~14 GB, takes 5–15 min depending on bandwidth) — budget accordingly.
+
+# 5. WandB auth (only needed for `--wandb-mode online`)
 python -c "import netrc, os; n=netrc.netrc(os.path.expanduser('~/.netrc')); print('wandb auth OK:', bool(n.hosts.get('api.wandb.ai')))"
 ```
 
@@ -554,15 +600,22 @@ model architecture and LoRA config, not on GPU count.
 
 ### Production launch
 
+Activation checkpointing is **default-on** in
+`scripts/finetune_evo2_lora.py` as of 2026-04-26 — no `--activation-checkpointing`
+flag needed. Pass `--no-activation-checkpointing` only if you explicitly
+want the no-AC path (constrained to `L≤4096` per §12.7).
+
+**Template A — conservative (recommended for the first multi-day run):**
+
 ```bash
+TS=$(date +%Y%m%d_%H%M%S)
 export HF_HOME=/data2/ds85/hf_cache
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 deepspeed --num_gpus=1 \
   scripts/finetune_evo2_lora.py \
   --train         data/processed/splits_combined/train.jsonl \
   --val           data/processed/splits_combined/val.jsonl \
-  --output-dir    /data2/ds85/bgcmodel_runs/phase1_lora \
-  --max-seq-len   8192 \
+  --output-dir    /data2/ds85/bgcmodel_runs/phase1_lora_prod_${TS}_L32768 \
+  --max-seq-len   32768 \
   --batch-size    4 \
   --grad-accum    32 \
   --lr            5e-5 \
@@ -576,27 +629,34 @@ deepspeed --num_gpus=1 \
   --seed          42
 ```
 
+**Template B — stretch (L=65,536):** identical to template A but with
+`--max-seq-len 65536` and output dir `..._L65536`. Only use this after a
+short L=65,536 pilot has confirmed val cadence + checkpoint behaviour at
+that length (see `PROJECT_GUIDE.md` §13.1 "decision gate").
+
+Both templates produce identical step counts (~2,166/epoch, ~4,332 over
+2 epochs at the default 128-sequence effective batch). Wall-clock differs
+roughly 2× between them (see §4 "Steps and time estimate"):
+
+| Template | Wall-clock | Peak GPU mem (production-like preflight, AC on) |
+|----------|-----------:|------------------------------------------------:|
+| A — L=32,768 | ~2.7 days | not directly measured at batch=4,ga=32 — extrapolated from L=49k–65k at ~52 GB |
+| B — L=65,536 | ~5.3 days | 74.17 GB (~6 GB headroom on 80 GB)             |
+
 > **Note on `--grad-accum`:** the script default is `8`, which was chosen
 > for trojai's 4-GPU setup and gives an effective batch of 32 at
 > `world_size=1`. Setting `--grad-accum 32` here restores the original
 > 128-sequence effective batch. See §4 "Effective batch size and throughput".
 >
-> **Note on `--max-seq-len`:** Start at 8192 rather than 32768. On trojai
-> L=4096 already OOM'd in the StripedHyena filter (see §12.3), but that
-> was with ZeRO-2 sharding adding 14 GB of filter tensor on top of a
-> rank that already held ~14 GB of bf16 weights. On an 80 GB gputee H100
-> with LoRA (no optimizer-state term, no 4× weight replication across
-> ranks) the same L might fit without activation checkpointing — but do
-> not assume it. Run the §12.7 smoke benchmark first.
+> **Note on `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`:** this
+> allocator hint is **not supported** on the gputee H100 (confirmed by
+> the 2026-04-25 no-AC OOM trace) — passing it is a harmless no-op. It
+> has been removed from the documented launch commands above to avoid
+> implying it's load-bearing.
 >
-> **Update after 2026-04-25 §12.7 results:** no-checkpoint LoRA reaches
-> `L=8192` only at near-ceiling memory (~80.1 GB) and OOMs at `L>=16384`.
-> For no-checkpoint training, use `--max-seq-len 4096` as the current safe
-> operating point. Reaching `L=32768` requires block-level activation
-> checkpointing, which is now implemented as the
-> `--activation-checkpointing` flag (see §12.7 "Retest with
-> `--activation-checkpointing`"). Run that retest sweep before launching a
-> long production run at `L>4096`.
+> **Note on `--no-activation-checkpointing`:** only relevant for the
+> no-AC baseline. Practically capped at `L≤4096` due to OOM beyond. The
+> production-like preflight and both templates above run with AC on.
 
 ### Resuming from a checkpoint
 
@@ -1337,8 +1397,22 @@ The existing `load_lora_checkpoint` already pulls adapter weights via
 base being serialised.
 
 **Status:** fix applied on gputee (not backported to trojai docs, per
-migration policy). Resume verification is still pending and is the
-remaining prerequisite before a long production run.
+migration policy). Resume verification is **still pending**. The
+L=32,768 pilot (`PROJECT_GUIDE.md` §13 NEXT) will exercise the save
+path at `--save-every 500` on real data; resume-correctness should be
+verified as a follow-up step on that pilot's checkpoint **before** the
+multi-day production launch.
+
+Suggested resume verification protocol:
+1. After the pilot reaches step ≥500, kill it (Ctrl-C in the tmux pane).
+2. Relaunch with the same flags plus
+   `--resume-from /data2/.../checkpoints/step_500`.
+3. Confirm `train_log.jsonl` continues with `step=501, 502, …` (not
+   restarting at 1) and that the LR matches what the cosine schedule
+   would produce at that step.
+4. Confirm GPU peak memory after resume matches the pre-kill peak
+   (within ~1 GB) — a mismatch could indicate the frozen base was
+   re-serialised somewhere.
 
 ---
 

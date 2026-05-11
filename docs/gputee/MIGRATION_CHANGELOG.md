@@ -547,6 +547,269 @@ flagged as an EDIT.
 
 ---
 
+## Memory characterisation + production readiness (2026-04-23 → 2026-05-11)
+
+Entries #27–#36 cover the work between the initial post-migration
+fix-up (entries #21–#26 above) and the current pre-pilot state. Most
+of these are not migration items per se — they are the gputee-specific
+characterisation and tooling work that the migration enabled.
+
+### 27. First gputee smoke benchmark sweep (no-AC)
+
+**Change:** Ran the §12.7 smoke benchmark across
+`L ∈ {1024, 4096, 8192, 16384, 32768}` with the no-AC code path on
+2026-04-25. Results recorded in `FINETUNE_GUIDE.md` §12.7 results
+table and §4 "Memory at runtime" table 2.
+
+**Why:** answered question 1 of the §12.7 plan (peak GPU memory per L
+on the H100). Established that the no-AC path is unsafe past L=4096
+on this hardware (L=8192 at 80.10 GB is near-saturation;
+L≥16,384 OOM).
+
+**Result:** the no-AC ceiling is materially lower than the original
+"likely fits without checkpointing" guess. Activation checkpointing
+became a project requirement, not a "nice to have", as a result.
+
+**Files:** none in this entry — it produced
+`/data2/ds85/bgcmodel_runs/queued_smoke_20260423_152219/` and the
+documentation updates landed in entry #28.
+
+### 28. Block-level activation checkpointing implemented + default-on
+
+**Change:** Added `enable_block_activation_checkpointing(model)` in
+`scripts/finetune_evo2_lora.py`. Wraps each of Evo2 7B's 32
+StripedHyena blocks in `torch.utils.checkpoint.checkpoint(...)` with
+`use_reentrant=False`. New CLI flags `--activation-checkpointing` /
+`--no-activation-checkpointing` (default: enabled). Applied **after**
+LoRA wrapping and **before** `deepspeed.initialize` so the
+checkpointed boundary contains both peft's adapter Linear modules and
+the frozen base.
+
+**Why:** entry #27 made it required to reach `L=32768`. The standard
+HuggingFace `model.gradient_checkpointing_enable()` path is unavailable
+because Evo2 doesn't load through `AutoModel` (it uses the vortex /
+StripedHyena loader). `use_reentrant=False` is **load-bearing** because
+`--lora-dropout=0.05` is non-zero — with the reentrant API the
+recomputed forward would produce a different dropout mask and
+gradients would be silently wrong.
+
+**Validation:** see entry #29.
+
+**Files:** `scripts/finetune_evo2_lora.py` (new function + 2 CLI
+flags + 1 call site after `apply_lora`); `FINETUNE_GUIDE.md` §12.7
+"What 'block-level activation checkpointing' actually means" subsection
+(detailed mechanics, dropout/determinism caveat, compute cost).
+
+### 29. AC-enabled smoke benchmark sweep
+
+**Change:** Reran the §12.7 sweep on 2026-04-26 with AC on. Results
+in `FINETUNE_GUIDE.md` §12.7 "Retest with activation checkpointing"
+and §4 "Memory at runtime" table 2.
+
+**Why:** validated entry #28 end-to-end and answered question 2 of
+the §12.7 plan ("is AC required to reach L=32 768?" → yes).
+
+**Result:** L=1024 (16.35 GB), L=4096 (19.10), L=8192 (22.77),
+L=16384 (30.10), **L=32768 (43.92 GB)** — all pass with substantial
+margin (~36 GB headroom at L=32k). The AC vs no-AC delta at L=8192 is
+roughly 80.10 → 22.77 GB, i.e. ~3.5× reduction, consistent with the
+"31 of 32 per-block filter tensors discarded between forward and
+backward" expectation.
+
+**Files:** `FINETUNE_GUIDE.md` §12.7 (new subsection + table); run
+artefacts at `/data2/ds85/bgcmodel_runs/queued_smoke_20260426_142830/`.
+
+### 30. `--smoke-pad-to-max-seq-len` flag + invalid-probe correction
+
+**Change:** Added `--smoke-pad-to-max-seq-len` flag to the trainer
+(and made it the default in `scripts/queue_h100_smoke.sh`). Pads each
+training micro-batch out to `--max-seq-len` regardless of the actual
+JSONL sample length.
+
+**Why:** the first long-L probe (`queued_smoke_20260426_153622`,
+L ∈ {49152, 65536, 98304}) used natural-length collation, which pads
+each micro-batch only to that micro-batch's longest sample. With
+`--batch-size 1` and a JSONL where the first few samples were short,
+the actual collated tensor lengths were far below `--max-seq-len` —
+so the same peak memory and loss traces appeared at L=49152, 65536,
+and 98304 (because all three were silently bounded by the same short
+samples). The probe was diagnostic-only, not a real memory test.
+
+**Detection:** caught by inspecting `collated_seq_len` (added to
+`train_log.jsonl`) vs the requested `--max-seq-len`. They didn't
+match — which the flag now forces them to.
+
+**Files:** `scripts/finetune_evo2_lora.py` (new `--smoke-pad-to-max-seq-len`
+flag, collator change, two new train_log fields `collated_seq_len` and
+`content_max_len`); `scripts/queue_h100_smoke.sh` (default-on);
+`FINETUNE_GUIDE.md` §12.7 "Caveat on the 2026-04-26 49152/65536/98304
+probe" subsection.
+
+### 31. Padded-collation long-L probe (real ceiling found)
+
+**Change:** Reran the long-L probe with `--smoke-pad-to-max-seq-len`
+on 2026-04-26 evening. Run root
+`/data2/ds85/bgcmodel_runs/queued_smoke_20260426_185444/`. Results in
+`FINETUNE_GUIDE.md` §12.7 "Extended-context probe results".
+
+**Result:** L=49152 (59.44 GB), L=65536 (74.11 GB), L=98304 OOM
+(`compute_filter()` tried to allocate 24 GiB). The practical AC-on
+ceiling is now bracketed between 65k and 98k.
+
+**Coverage impact recorded** in `FINETUNE_GUIDE.md` §12.7.1: moving
+from L=32,768 to L=65,536 lifts full-record coverage on the combined
+train split from 64.8% to 92.7% (+27.8 pp). This is the trade-off
+underpinning the conservative-vs-stretch decision in §13.1.
+
+**Files:** `FINETUNE_GUIDE.md` §12.7 / §12.7.1 (new sections and
+tables).
+
+### 32. Queued GPU-idle launcher scripts
+
+**Change:** Added `scripts/queue_h100_smoke.sh` and
+`scripts/queue_h100_preflight.sh` (2026-04-28). Both wait for
+`nvidia-smi`-observed GPU idleness + a free-memory floor for a
+configurable hold window before kicking off the trainer. Re-check
+idleness between matrix entries. Write per-length stdout logs and a
+machine-readable `summary.tsv`. Defaults: `--min-free-mib 60000`,
+`--idle-hold-sec 30`.
+
+**Why:** gputee is shared. Previously each manual launch needed an
+ad-hoc `nvidia-smi` poll; the AC-sweep and long-L work showed that
+queued launches are the only safe way to run multi-length matrices
+without trampling other users mid-run.
+
+**Files:** `scripts/queue_h100_smoke.sh` (9,603 bytes),
+`scripts/queue_h100_preflight.sh` (9,781 bytes); both
+chmod +x. `FINETUNE_GUIDE.md` §12.7 "Queued smoke benchmark"
+subsection.
+
+### 33. `check_data_eval_readiness.py` + readiness-snapshot pattern
+
+**Change:** Added `scripts/check_data_eval_readiness.py` and the
+`docs/gputee/readiness_snapshots/` directory. The script verifies
+every data file the 8-metric eval needs (combined splits, Pfam HMM,
+NPAtlas JSON, UniRef50 MMseqs DB, antiSMASH databases) and every
+required CLI binary (`download-antismash-databases`, `mmseqs`,
+`deepspeed`, `python`). First archived snapshot:
+`readiness_snapshots/readiness_20260428_104336.json` (all required
+items green).
+
+**Why:** every previous failure mode in this project has been "we
+thought X was present, it wasn't." The script makes that check
+explicit, machine-readable, and archivable per production run.
+
+**Files:** `scripts/check_data_eval_readiness.py`,
+`docs/gputee/readiness_snapshots/readiness_20260428_104336.json`.
+Referenced from `PROJECT_GUIDE.md` §13.2 and `FINETUNE_GUIDE.md` §6
+pre-flight checks.
+
+### 34. Production-run scaffolding codified (PROJECT_GUIDE §13.1 / §13.2)
+
+**Change:** Rewrote `PROJECT_GUIDE.md` §13 with:
+- §13.1 "Production run scaffolding" — fixed run-directory convention
+  (`/data2/ds85/bgcmodel_runs/phase1_lora_prod_<TS>_L<LEN>/`),
+  required artefacts list, launch templates A (conservative L=32k)
+  and B (stretch L=65k), restart SOP, operational guardrails.
+- §13.2 "Data and evaluation readiness" — readiness check workflow,
+  current snapshot pointer, archive-per-launch policy.
+
+**Why:** the post-preflight state has many small concrete decisions
+that were previously implicit ("which output dir? which template?
+what to do if it OOMs?"). Codifying them removes friction and
+ambiguity at launch time.
+
+**Files:** `docs/gputee/PROJECT_GUIDE.md` §13.1 + §13.2.
+
+### 35. Production-like preflight sweep (real batch/grad-accum/data)
+
+**Change:** Ran the queued preflight script over
+`L ∈ {40960, 49152, 57344, 61440, 65536}` from 2026-04-29 14:29 to
+2026-05-01 18:06 (~30 hours wall clock total). Each L: real
+`data/processed/splits_combined/train.jsonl`, AC on,
+`--batch-size 4 --grad-accum 32`, 20 optimizer steps. Run root
+`/data2/ds85/bgcmodel_runs/queued_preflight_20260427_110056/`. Summary
+in `.../summary.tsv` and `FINETUNE_GUIDE.md` §4 "Memory at runtime"
+table 3.
+
+**Why:** the AC-sweep numbers (#29) were measured at batch=1
+grad_accum=1. Production batch is 16× larger (4×4 grad-accum doesn't
+change peak memory but 4× batch does). Without a production-like
+preflight there was no evidence that L=65,536 stayed feasible under
+real settings.
+
+**Result:** all five lengths passed. **L=65,536 peaked at 74.17 GB**
+on the 80 GB device (~6 GB headroom) with throughput stable at
+~3,275 tok/s across all 20 steps per L. This is the strongest
+single piece of evidence that L=65,536 is a feasible stretch target.
+
+**What it does NOT prove** (and the L=32k pilot is meant to address):
+the preflight ran 20 steps per L, well short of the `--val-every 250`
+boundary, so validation cadence, checkpoint write path under the
+`exclude_frozen_parameters=True` fix (entry #24), and
+resume-from-checkpoint semantics on real data have **never** been
+exercised end-to-end.
+
+**Files:** `FINETUNE_GUIDE.md` §4 (new table 3); run artefacts on
+`/data2`; `PROJECT_GUIDE.md` §13 completed table.
+
+### 36. §13 NEXT retargeted to L=32k pilot on combined splits
+
+**Change:** Demoted "optional midpoint bracketing
+(L ∈ {73728, 81920, 90112})" from the ⭐ NEXT slot and promoted the
+"L=32768 pilot on real combined splits" as the new gating step
+before the multi-day production launch.
+
+**Why:** entry #35 made it clear that the remaining unknowns are
+*operational* (val cadence, checkpoint save, resume) rather than
+*memory-bound*. Tightening the L upper bound between 65k and 98k
+doesn't change which L we'd actually choose for the first production
+run (the conservative L=32,768 path is already strongly motivated by
+the headroom in #29 and the simplicity of resume-on-first-attempt).
+A pilot at L=32,768 exercises the full pipeline including the
+validation + checkpoint code paths that the preflight skipped.
+
+**Files:** `docs/gputee/PROJECT_GUIDE.md` §13 NEXT row + §13.1
+"Immediate path" paragraph (the diff that was uncommitted in the
+working tree as of 2026-05-11 and is now committed alongside this
+documentation refresh).
+
+### 37. Documentation refresh — 2026-05-11
+
+**Change:** Brought `PROJECT_GUIDE.md`, `FINETUNE_GUIDE.md`, both
+READMEs, and this changelog up to date with the post-preflight state.
+Specifically:
+- `PROJECT_GUIDE.md`: refreshed date stamp, §3.1 env-creation status,
+  §3.3 GPU-stack pip steps (now reference `FINETUNE_GUIDE.md` §2 for
+  the working sequence), §3.3 disk-layout snapshot (`/home` 16 GB free,
+  `/data2` 1.5 TB free), §3.4 UniRef50 status (restored), and the §13
+  "Completed" table (entries #27–#36 above as one-line rows).
+- `FINETUNE_GUIDE.md`: refreshed date stamp + framing, replaced the
+  three "pending" memory tables in §4 with the measured no-AC, AC-on,
+  and production-like preflight tables; replaced the speculative
+  "1.5–3 day" wall-clock estimate with the measured-throughput-derived
+  estimate (~2.7 days at L=32k, ~5.3 days at L=65k); rewrote the §6
+  pre-flight checks to point at `/data2`, `HF_HOME`, and the readiness
+  snapshot rather than the obsolete `/home`-centred checks; rewrote
+  the §6 production launch into templates A (L=32k, conservative) and
+  B (L=65k, stretch) with the actual recommended flags; added an
+  explicit resume-verification protocol to §12.8 (still pending —
+  L=32k pilot is the trigger).
+- `docs/gputee/README.md` and root `README.md`: added a callout that
+  `environment.yml` alone does not produce a working env and to
+  consult `FINETUNE_GUIDE.md` §2 for the sequence that does.
+
+**Why:** the previous "last updated 2026-04-29" stamp was already two
+weeks stale and several load-bearing tables (§4 memory, §4 time
+estimate, §6 production launch) still pointed at TBD/pending values
+that have since been measured.
+
+**Files:** `docs/gputee/PROJECT_GUIDE.md`, `docs/gputee/FINETUNE_GUIDE.md`,
+`docs/gputee/README.md`, `README.md`, this changelog. No code
+changes in this entry.
+
+---
+
 ## Summary of what was intentionally left unchanged
 
 - **All code logic in `scripts/finetune_evo2*.py`** apart from the top

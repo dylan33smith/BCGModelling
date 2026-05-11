@@ -35,4 +35,9 @@ conda env create -f environment.yml
 micromamba create -n bgcmodel -f environment.yml
 ```
 
-See `docs/gputee/PROJECT_GUIDE.md` §3 for the full GPU-stack install sequence.
+> **Heads up:** `environment.yml` alone does not produce a working env on a
+> fresh create. The pip step fails on `flash-attn` (it `import torch`s at
+> build time before torch is installed). The conda side does finish
+> cleanly. See `docs/gputee/FINETUNE_GUIDE.md` §2 for the working
+> install sequence on gputee, and `docs/gputee/PROJECT_GUIDE.md` §3
+> for the broader environment-setup context.
