@@ -2,7 +2,9 @@
 
 **Using Genome Language Models**
 
-*Research Plan  |  Dylan Smith  |  April 2026  |  Version 8*
+*Research Plan  |  Dylan Smith  |  May 2026  |  Version 9*
+
+> **Version 9 note:** Sections §3.2–§4 and §8–§11 were refreshed to match the **implemented** repository (`scripts/finetune_evo2_lora.py`, combined splits, gputee H100). Earlier drafts assumed BioNeMo full fine-tuning on an RTX A6000 and claimed LoRA was incompatible with Evo2—that narrative is **superseded**. Canonical operational detail: `PROJECT_GUIDE.md`, `FINETUNE_GUIDE.md`.
 
 # **1\. Overview and Motivation**
 
@@ -42,9 +44,17 @@ No separate chassis label is needed. This tag conditions the model toward the ta
 
 Evo2 uses the StripedHyena 2 architecture — a hybrid of local convolutional Hyena operators, selective state-space components, and interspersed attention pockets — supporting a 1-million base pair context window at near-linear compute scaling. The 7-billion parameter checkpoint (arcinstitute/evo2\_7b\_262k on HuggingFace) is the primary fine-tuning target.
 
-### **Critical Finding: LoRA Incompatibility**
+### **Fine-tuning approach (implemented)**
 
-LoRA (Low-Rank Adaptation) is not currently compatible with Evo2. LoRA assumes linear weight matrices in transformer attention blocks, but StripedHyena 2's convolutional operators and state-space components do not fit this assumption. As of April 2026, LoRA support for Evo2 is an open feature request (NVIDIA BioNeMo issue \#884) but has not been implemented. Full fine-tuning is therefore required, demonstrated to run on a single RTX A6000 (45 GB VRAM) in approximately one hour in bfloat16 precision using the NVIDIA BioNeMo framework. The 40B checkpoint requires multiple H100 GPUs and is deferred to a later project phase. University HPC or cloud GPU access (NSF ACCESS, AWS, Google Cloud) is required.
+Training uses **LoRA** via HuggingFace **PEFT** on Evo2 7B (`scripts/finetune_evo2_lora.py`), not NVIDIA BioNeMo and not full-parameter fine-tuning on consumer GPUs. Adapters target named **`nn.Linear`** layers across StripedHyena blocks (`Wqkv`, `out_proj`, `out_filter_dense`, MLP `l1`/`l2`/`l3`). Convolutional Hyena operators and state-space internals remain **frozen**; ~28.7M trainable parameters (~0.44% of ~6.5B).
+
+Older statements that “LoRA is incompatible with Evo2” referred to **first-party BioNeMo packaging** and integration assumptions (public issue-tracker discussion), not whether low-rank adapters can be attached to linear projections in PyTorch. This project demonstrates they can, with Evo2↔DeepSpeed↔PEFT fixes recorded in `FINETUNE_GUIDE.md` §12.6.
+
+**Why not full fine-tuning:** bf16 weights + gradients + AdamW optimizer states already require **≥84 GB VRAM before activations**, which exceeds a single **80 GB H100** and still tends to OOM at moderate sequence lengths without activation checkpointing. Historical multi-GPU ZeRO runs did not change that conclusion for long-context BGC windows.
+
+**Why not BioNeMo:** Docker-oriented, NeMo/Megatron stack aimed at multi-node clusters; poor fit for transparent single-GPU iteration on a shared lab host—see `FINETUNE_GUIDE.md` §1 (“Why BioNeMo is still not used”). BioNeMo fine-tuning tutorials remain a useful **reference** for defaults and sequence packing.
+
+**Operational hardware:** Primary host **gputee** — 1× NVIDIA H100 PCIe 80 GB. Memory sweeps, activation checkpointing defaults, queue scripts, and launch templates: `PROJECT_GUIDE.md` §13, `FINETUNE_GUIDE.md` §§4–6 and §12.7. The **40B Evo2** checkpoint remains out of scope on current hardware.
 
 ### **Conditioning Token Format**
 
@@ -56,7 +66,7 @@ Training examples prepend **fixed-order** conditioning tokens to the Evo2 taxono
 
 (Classes are illustrative; the actual string is taken from the harmonised vocabulary in Section 4.2. Compound bodies are normalised names; Section 4.2.)
 
-**antiSMASH database v4 examples (breadth / class supervision, no specific metabolite):**
+**antiSMASH DB mass-download examples — Phase 2+ target (breadth / class supervision with explicit `NO_COMPOUND` sentinel):**
 
 |COMPOUND_CLASS:NRPS| \+ |COMPOUND:NO_COMPOUND| \+ \[native producer or source-organism taxonomic tag\] \+ \[BGC nucleotide sequence\]
 
@@ -68,21 +78,18 @@ Training examples prepend **fixed-order** conditioning tokens to the Evo2 taxono
 
 **Inference:** Set `COMPOUND_CLASS` and `COMPOUND` to the target (class from harmonised map, compound as in MIBiG—**never** `NO_COMPOUND` for designed generation toward a named product), and switch the taxonomic tag to the desired chassis (e.g. E. coli). Primary evaluation metric 1 (antiSMASH class) is interpreted against the conditioned `COMPOUND_CLASS`.
 
-The training corpus draws from MIBiG 4.0 (3,059 experimentally validated BGCs with known compound labels, released December 2024\) as the primary source and antiSMASH database v4 (231,534 BGCs) for class-labelled breadth and overfitting prevention. The cross-organism generalisation implicit in the chassis tag swap is directly tested by the evaluation suite.
+The training corpus draws from **MIBiG 4.0** (experimentally validated BGCs with harmonised class labels) and **antiSMASH DB v5** bulk GBKs processed into JSONL (**343,923 records** in the migrated pipeline as of the combined-merge snapshot—see `PROJECT_GUIDE.md` §5). **Phase 1** merged training uses **class-only** conditioning aligned across both sources (MIBiG **`COMPOUND` tokens are omitted** in the merged Phase 1 format—see `PROJECT_GUIDE.md` §7 and phased roadmap §9). The hierarchical **`COMPOUND` slot + `NO_COMPOUND` sentinel** design below remains the **Phase 2+ target** once compound-level supervision is re-enabled without breaking class-only antiSMASH rows.
 
-### **Training protocol (staged data, mitigating catastrophic forgetting)**
+### **Training protocol**
 
-Fine-tuning proceeds in **two corpus phases**, in order: **(1) antiSMASH** (`COMPOUND_CLASS` \+ `COMPOUND:NO_COMPOUND` for breadth), then **(2) MIBiG** (`COMPOUND_CLASS` \+ real `COMPOUND` for compound-specific refinement). Before **each** phase begins—or equivalently, at the start of each phase after loading the checkpoint produced by the previous phase—the following **warm-up** is applied to reduce **catastrophic forgetting** of pretrained genomic grammar:
+**Implemented (Phase 1, May 2026):** **Single-pass LoRA** fine-tuning on **`data/processed/splits_combined/{train,val,test}.jsonl`** with DeepSpeed + optional block-level activation checkpointing (default-on for long context on one H100). Scripts, hyperparameters, logging, checkpoints, and the **L=32k pilot → production** gate are documented in `PROJECT_GUIDE.md` §13 and `FINETUNE_GUIDE.md`. There is **no separate embedding-only warm-up stage** in the shipped trainer—LoRA already restricts optimisation to adapter weights.
 
-* **Freeze the pretrained backbone:** set all **base Evo2 parameters** (Hyena blocks, state-space layers, attention pockets, and other non-input weights) to **non-trainable** / zero their optimizer gradients.  
-* **Train only conditioning-related parameters:** allow gradients **only** for weights that implement the **new** `COMPOUND_CLASS` and `COMPOUND` conditioning signal. In practice this usually means the **token embedding table rows** (and, if the framework ties or projects them, the corresponding **output / LM head** rows) for the token IDs that encode the harmonised class strings, compound names, `NO_COMPOUND`, and delimiter structure as realised by the Evo2 tokenizer. If a conditioning span is split into multiple subword tokens, designate the full set of involved IDs as the trainable subset (or add **reserved special tokens** for each `COMPOUND_CLASS:` and `COMPOUND:` prefix pattern if BioNeMo allows vocabulary extension—document the exact scheme in methods).  
-* **Warm-up duration:** run this frozen-backbone phase for a **fixed step budget or until validation loss on a small held-out BGC slice stabilises** (e.g. early segment of antiSMASH val, then MIBiG val), then **unfreeze** the full model and continue with **full fine-tuning** using a **conservative learning rate** on the backbone. The second phase (MIBiG) may repeat the same pattern: load the antiSMASH-phase checkpoint, freeze backbone, warm up new **compound-name** embeddings if many IDs were rare in phase 1, then unfreeze for joint training.
+**Optional future curriculum (not required for Phase 1 launch):** If Phase 2 introduces **`COMPOUND`** tokens again alongside class-only antiSMASH rows, consider revisiting **staged corpora** or **embedding-interface warm-ups** to limit catastrophic forgetting:
 
-**Rationale:** Updating only the embedding interface first lets the model learn **where** class and compound information enter the sequence distribution **without** immediately overwriting low-level nucleotide statistics learned from trillions of pretraining tokens. Unfreezing afterward aligns the backbone to BGC-conditioned objectives while the warm-up has already anchored the new tokens.
+* Freeze backbone / train only conditioning-related embedding rows first, then unfreeze with conservative backbone LR (historical BioNeMo-centric framing used parameter groups and callbacks—equivalent patterns are expressible in raw PyTorch `requires_grad` masks).  
+* Alternatively compare **full LoRA from step zero** vs staged protocols using generic-genomic perplexity holdouts.
 
-**Implementation note:** NVIDIA BioNeMo / Evo2 may expose this via **parameter groups** (embedding-only LR \> 0, backbone LR = 0), **requires_grad** masks, or custom callbacks. If a strict embedding-only phase is not supported, approximate it with **very small backbone LR** and **large embedding LR** for the first segment of each phase, and report the approximation in methods.
-
-**Ablation:** compare the default protocol to **full-model fine-tuning from step zero** of each phase to quantify forgetting (e.g. perplexity of generic genomic holdouts under the base Evo2 checkpoint vs after each stage).
+Treat this subsection as **research directions** once compound conditioning lands, not as a prerequisite for the current binary.
 
 # **4\. Data Plan**
 
@@ -91,13 +98,13 @@ Fine-tuning proceeds in **two corpus phases**, in order: **(1) antiSMASH** (`COM
 | Database | Version | BGC Count | Access | Role |
 | :---- | :---- | :---- | :---- | :---- |
 | MIBiG | 4.0 (Dec 2024\) | 3,059 | mibig.secondarymetabolites.org | Primary fine-tuning: **`COMPOUND_CLASS` \+ `COMPOUND`** per entry, experimentally validated BGCs |
-| antiSMASH DB | v4 (2024) | 231,534 | antismash-db.secondarymetabolites.org | Secondary fine-tuning: **`COMPOUND_CLASS` \+ `COMPOUND:NO_COMPOUND`**, breadth and shared class backbone |
+| antiSMASH DB | **v5** (Jan 2026\) | **343,923 records** in migrated JSONL; ~497K BGCs at DB scope | antismash-db.secondarymetabolites.org | Class-only **`COMPOUND_CLASS`** rows for breadth (`PROJECT_GUIDE.md` §4.3); merged with MIBiG for Phase 1 training |
 | NPAtlas | 3.0 | 36,545 compounds | npatlas.org | Compound label normalisation and **auxiliary mapping** from structures or names to harmonised `COMPOUND_CLASS` where helpful |
 
 ## **4.2  Data Pipeline**
 
 * Download MIBiG 4.0 JSON \+ GenBank files. Each entry contains GenBank accession, genomic coordinates, compound name, BGC class, and organism taxonomy. Unpack the GenBank bundle to a directory of per-cluster `.gbk` files (e.g. `mibig_gbk_4.0/`). The repository preprocessing script `scripts/mibig_to_jsonl.py` reads that directory by default (`--mibig-gbk`); `mibig_gbk_4.0.tar.gz` remains supported as an alternative input if the archive is not unpacked.  
-* Download antiSMASH v4 BGC data as GenBank/FASTA bulk exports.  
+* Download antiSMASH DB **v5** bulk GBKs (173 GB source tar optional if regenerated JSONL not needed — migrated pipeline ships processed JSONL; see `PROJECT_GUIDE.md` §4.3).  
 * For each entry: extract BGC nucleotide sequence from GenBank record using stored coordinates. Validate integrity (no frameshifts, complete start/stop codons).  
 * **Define a single harmonised `COMPOUND_CLASS` vocabulary** used by both corpora. Map MIBiG’s BGC/product class fields and antiSMASH’s predicted product types into this namespace (manual rules table \+ NPAtlas / ontology support where names disagree). Document every mapping for reproducibility.  
 * Build the **`COMPOUND`** label vocabulary from MIBiG compound names (normalised, e.g. via NPAtlas). **Reserve `NO_COMPOUND`** and enforce that no real compound normalises to that literal.  
@@ -236,7 +243,7 @@ Three compounds are selected spanning distinct BGC chemical classes (each mapped
 
 Wet lab validation is planned but contingent on securing an appropriate collaborator. The computational evaluation suite in Section 5 is designed to be independently convincing for publication. If wet lab data is obtained, it strengthens the paper substantially and enables higher-tier journal submission.
 
-For each of the three target compounds, one BGC sequence **generated under the same hierarchical conditioning as training** (`COMPOUND_CLASS`, `COMPOUND`, and E. coli taxonomic tag) and passing all Tier 1 computational metrics is submitted to a commercial gene synthesis provider (Twist Bioscience or IDT), cloned into pETDuet-1 or equivalent, transformed into E. coli BL21(DE3), induced with IPTG, and culture extracts are analysed by HPLC with UV-Vis detection at the compound-specific wavelength.
+For each of the three target compounds, one BGC sequence **generated under the same conditioning template used at inference-time fine-tune evaluation** (`COMPOUND_CLASS` required; **`COMPOUND` only once Phase 2+ compound conditioning is active**) plus E. coli taxonomic tag, passing all Tier 1 computational metrics, is submitted to a commercial gene synthesis provider (Twist Bioscience or IDT), cloned into pETDuet-1 or equivalent, transformed into E. coli BL21(DE3), induced with IPTG, and culture extracts are analysed by HPLC with UV-Vis detection at the compound-specific wavelength.
 
 ## **7.2  Controls**
 
@@ -250,21 +257,27 @@ Standard academic molecular biology or microbiology labs are sufficient. Require
 
 # **8\. Open Questions and Risks**
 
-## **8.1  Full Fine-Tuning Without LoRA**
+## **8.1  Adapter fine-tuning vs full-parameter training**
 
-LoRA is not currently compatible with Evo2's StripedHyena 2 architecture. Full fine-tuning requires at minimum a single A6000 (45 GB VRAM), demonstrated via the BioNeMo tutorial. University HPC or cloud GPU access must be secured before beginning. If LoRA support is added to BioNeMo for Evo2 (open issue \#884), this constraint will be lifted.
+**Resolved for Phase 1:** LoRA via PEFT on Evo2 7B is **implemented and validated** on lab hardware (smoke + production-like preflight through **L=65,536** tokens under activation checkpointing on one H100—see `FINETUNE_GUIDE.md` §12.7.1). Full-parameter fine-tuning remains **disallowed by memory** on single-GPU 80 GB class hardware without architectural changes.
+
+**Residual risk:** Adapter capacity (`--lora-r`, currently 16) may limit expressiveness vs full FT; monitor validation loss and raise rank if training plateaus early (`PROJECT_GUIDE.md` §13 Future enhancements).
 
 ## **8.2  Small Fine-Tuning Dataset**
 
-MIBiG 4.0 has 3,059 entries. The antiSMASH augmentation ( **`COMPOUND_CLASS` \+ `COMPOUND:NO_COMPOUND`** ) is important for generalisation; **MIBiG rows must use that same class token** alongside a **real** `COMPOUND` so the two regimes share both prefix slots. Validation loss on held-out MIBiG entries must be monitored. The BiG-SCAPE distance check and MMseqs2 sequence identity check are the primary defences against memorisation. **Catastrophic forgetting** of pretrained sequence statistics is mitigated by the **staged embedding warm-up** in Section 3.2 (Training protocol); skipping it may degrade Tier 2 perplexity vs generic genome baselines.
+MIBiG 4.0 has ~3k validated clusters—the bulk of supervision comes from **antiSMASH DB v5–derived JSONL** merged into **`splits_combined`** (`PROJECT_GUIDE.md` §5). **Phase 1** uses **shared `COMPOUND_CLASS`** across MIBiG and antiSMASH with **no `COMPOUND` token** on merged rows (MIBiG compound names withheld—see `PROJECT_GUIDE.md` §9 Phase 1). When Phase 2 reintroduces **`COMPOUND`** on MIBiG while keeping antiSMASH class-only, revisit memorisation checks (BiG-SCAPE distance, MMseqs2 identity) and optionally the **optional staged curriculum** sketched in §3.2.
+
+* **Catastrophic forgetting** risk rises when new conditioning slots enter mid-project; LoRA-only Phase 1 already limits backbone drift. Tier 2 perplexity vs generic genome holdouts remains a diagnostic if perplexity collapses after conditioning changes.
 
 ## **8.3  Cross-Organism Generalisation**
 
-BGCs in MIBiG come from native producer organisms, not E. coli. The **`COMPOUND_CLASS` and `COMPOUND` labels** are paired with non-E. coli taxonomic tags during training. Metric 7 (CAI, GC content, dinucleotide statistics) directly tests whether the E. coli tag swap at inference produces organism-compatible sequences. If CAI values are systematically low, a mitigation is to codon-optimise MIBiG sequences to E. coli usage before fine-tuning so the model learns E. coli-compatible BGC sequences directly.
+BGCs in MIBiG come from native producer organisms, not E. coli. Training pairs **`COMPOUND_CLASS`** (and, in Phase 2+, **`COMPOUND`**) with non-E. coli taxonomic tags where applicable. Metric 7 (CAI, GC content, dinucleotide statistics) tests whether the E. coli tag swap at inference yields organism-compatible sequences. If CAI values are systematically low, consider codon-optimising MIBiG sequences to E. coli usage **before** fine-tuning (future experiment).
 
-## **8.4  Compute Access**
+## **8.4  Compute access**
 
-Full fine-tuning of Evo2 7B requires approximately 45 GB VRAM. University HPC or cloud GPU allocation should be secured before the fine-tuning phase. BioNeMo on a single A6000 is the minimum viable setup; the 40B model is deferred.
+**Resolved:** Primary GPU is **1× NVIDIA H100 PCIe 80 GB** on **gputee**. Queue helpers (`scripts/queue_h100_smoke.sh`, `scripts/queue_h100_preflight.sh`) coordinate idle-GPU launches on a shared host. HuggingFace cache and run outputs live on **`/data2`** (`HF_HOME=/data2/ds85/hf_cache`, `--output-dir /data2/ds85/bgcmodel_runs/...`) because **`/home` is disk-constrained**. Multi-day wall-clock estimates (~2.7 days at L=32k, ~5.3 days at L=65k for two epochs at measured throughput) are in `FINETUNE_GUIDE.md` §4.
+
+**Outstanding:** First **L=32k pilot** on combined splits must still validate val/checkpoint/resume paths before locking a multi-day production launch (`PROJECT_GUIDE.md` §13 NEXT).
 
 ## **8.5  Timeline Risk from Competing Work**
 
@@ -272,31 +285,40 @@ Kawano et al. explicitly named Evo integration as their next direction. A litera
 
 # **9\. Publication Strategy**
 
-The intended publication is a full research article. The narrative arc is: (1) establish the gap — no existing tool generates nucleotide-level BGC sequences with **hierarchical compound and class conditioning** tied to large-scale BGC data; (2) present the fine-tuning pipeline (**shared `COMPOUND_CLASS` across MIBiG and antiSMASH**, real `COMPOUND` on MIBiG and **`COMPOUND:NO_COMPOUND` on bulk antiSMASH** for a fixed prefix template); (3) demonstrate rigorous computational validation across eight independent metrics spanning biological validity, manufacturability, naturalness, novelty, and host compatibility; (4) prospectively demonstrate experimental proof-of-concept with three chemically diverse compounds in E. coli.
+The intended publication is a full research article. The narrative arc is: (1) establish the gap — no existing tool generates nucleotide-level BGC sequences with **harmonised biosynthetic-class conditioning** tied to large-scale BGC corpora at Evo2 scale; (2) present the **implemented** fine-tuning pipeline (**Phase 1:** shared **`COMPOUND_CLASS`** across MIBiG + antiSMASH DB v5 merged JSONL, LoRA + DeepSpeed + activation checkpointing on **gputee** H100—see `PROJECT_GUIDE.md`; **Phase 2+:** hierarchical **`COMPOUND`** slot as in §3.2 examples); (3) computational validation across eight metrics; (4) optional wet lab proof-of-concept.
 
 Target journals: ACS Synthetic Biology and Metabolic Engineering with positive wet lab results; PLOS Computational Biology or Bioinformatics for a computational-only submission. The eight-metric evaluation suite is designed to be sufficient for a computational-only paper at a strong journal.
 
 # **10\. Computational Environment**
 
-All pipeline and evaluation tools are managed via a single conda environment:
+The **`bgcmodel`** environment is defined at the project root (`environment.yml`). On **gputee**, create and activate with **micromamba** (not conda):
 
-    conda activate bgcmodel
+```bash
+micromamba activate bgcmodel
+```
 
-The environment is defined in `environment.yml` at the project root and includes: antiSMASH 8.0, pyhmmer, DNA Chisel, BiG-SCAPE 2.0, MMseqs2, Foldseek, prodigal, Biopython, and PyYAML. GPU-dependent tools (ESMFold, Evo2) are installed separately on HPC. **All scripts in this project must be run within the `bgcmodel` conda environment.**
+> **`environment.yml` alone does not produce a working env on a fresh create** — the pip phase fails on `flash-attn` before `torch` is installed. Follow **`FINETUNE_GUIDE.md` §2** for the working sequence (torch → prebuilt flash-attn wheel → `micromamba env update` → `deepspeed`/`peft`/`wandb`).
 
-To recreate: `conda env create -f environment.yml`
+Included (conda-forge/bioconda): antiSMASH 8.x tooling, pyhmmer, DNA Chisel, BiG-SCAPE 2.0, MMseqs2, Foldseek, Prodigal, Biopython, PyYAML. **GPU stack** (PyTorch + flash-attn + transformers + Evo2 + DeepSpeed + PEFT + WandB): installed per §2 of the fine-tune guide. **`PYTHONPATH=src`** when running pipeline scripts.
 
-antiSMASH additionally requires its reference databases: `download-antismash-databases`
+Reference antiSMASH databases: `download-antismash-databases`
 
 # **11\. Immediate Next Steps**
 
-* Set up literature alerts on 'Evo2 biosynthetic gene cluster', 'genomic language model BGC design', and 'nucleotide-level BGC generation' immediately.  
-* Download MIBiG 4.0 and antiSMASH v4 data; keep MIBiG GenBank as unpacked `mibig_gbk_4.0/*.gbk` (or point `--mibig-gbk` at `mibig_gbk_4.0.tar.gz`); **draft the harmonised `COMPOUND_CLASS` mapping** (MIBiG ↔ antiSMASH ↔ evaluation tools); write and test the data formatting pipeline per Section 3.2 (MIBiG: `COMPOUND_CLASS` \+ real `COMPOUND`; antiSMASH: `COMPOUND_CLASS` \+ `COMPOUND:NO_COMPOUND`; optionally ablate by **omitting** `COMPOUND` on antiSMASH) on a small subset before committing to full preprocessing; implement **MIBiG val/test deduplication from antiSMASH** (Section 4.4); then create a class-distribution graphic reporting counts and percentages per harmonised `COMPOUND_CLASS` for both antiSMASH and MIBiG.  
-* Build the complete evaluation pipeline as a standalone Python script and run it against known MIBiG BGC sequences (as positive controls) and randomly shuffled sequences (as negative controls) to validate each metric's discriminative power before generating any model output.  
-* Apply for HPC cluster or cloud GPU access (A6000-class minimum) running NVIDIA BioNeMo with the Evo2 7B checkpoint.  
-* Obtain the Kawano et al. domain-level model weights (GitHub: umemura-m/bgc-transformer) for use as the independent domain-architecture evaluation metric.  
-* Begin fine-tuning on the antiSMASH dataset with **`COMPOUND_CLASS` \+ `COMPOUND:NO_COMPOUND`** first, then add or phase in the smaller MIBiG dataset with **`COMPOUND_CLASS` \+ real `COMPOUND`** so the class backbone learned at scale is reused for compound-specific refinement. **Before each phase, follow Section 3.2 (Training protocol):** freeze the pretrained backbone and warm up **only** `COMPOUND_CLASS` / `COMPOUND`–related embeddings (then unfreeze for full fine-tuning) to limit catastrophic forgetting.  
-* Identify wet lab collaborator with E. coli expression capability and HPLC access, treating this as parallel to computational work rather than sequential.
+Operational priorities are tracked in **`PROJECT_GUIDE.md` §13**. As of May 2026:
+
+1. **Run the L=32,768 pilot** on **`data/processed/splits_combined/{train,val}.jsonl`** with production-like settings (`--batch-size 4`, `--grad-accum 32`, activation checkpointing on, **no** `--smoke-pad-to-max-seq-len`), enough steps to cross **`--val-every 250`** and **`--save-every 500`**, output under **`/data2/ds85/bgcmodel_runs/`**.
+2. **`scripts/check_data_eval_readiness.py --json`** before launch; archive snapshot beside the run (`PROJECT_GUIDE.md` §13.2).
+3. Execute **`FINETUNE_GUIDE.md` §12.8** resume sanity check on a pilot checkpoint before committing wall-clock to the full 2-epoch job.
+4. **Choose production `--max-seq-len`:** **32,768** (conservative margin) vs **65,536** (stretch; ~74 GB peak in production-like preflight—see `FINETUNE_GUIDE.md` §4).
+5. **Literature alerts** on Evo2 + BGC generation / nucleotide-level design (competitive-awareness).
+6. **Obtain Kawano et al. domain-model weights** (`umemura-m/bgc-transformer`) if not already cached—for independent M2-style evaluation.
+7. **Wet lab collaborator** search remains parallel to computational milestones (`PROJECT_GUIDE.md` §13).
+
+Research-facing tasks that remain independent of the trainer:
+
+* Harmonised **`COMPOUND_CLASS`** mapping audits and publication-ready counts for Methods (deduplication statistics table §4.4 — fill from pipeline logs when regenerating splits).
+* Standalone evaluation harness regression tests on MIBiG positives vs shuffled negatives before trusting metrics on generated sequences.
 
 # **Key References**
 
@@ -319,4 +341,4 @@ van Kempen, M. et al. Fast and accurate protein structure search with Foldseek. 
 
 Steinegger, M. and Soeding, J. MMseqs2 enables sensitive protein sequence searching for the analysis of massive data sets. Nat. Biotechnol. 35, 1026-1028 (2017).
 
-NVIDIA BioNeMo Evo2 Fine-Tuning Tutorial: docs.nvidia.com/bionemo-framework/2.6/user-guide/examples/bionemo-evo2/fine-tuning-tutorial/
+NVIDIA BioNeMo Evo2 fine-tuning tutorial (reference only — operational stack is PyTorch + DeepSpeed + PEFT): [BioNeMo Evo2 fine-tuning tutorial](https://docs.nvidia.com/bionemo-framework/2.6/user-guide/examples/bionemo-evo2/fine-tuning-tutorial/)

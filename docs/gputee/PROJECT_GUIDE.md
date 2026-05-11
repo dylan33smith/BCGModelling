@@ -88,14 +88,14 @@ BCGModelling/
     │   ├── names.dmp               # 266 MB — taxon ID ↔ names         ✅ on gputee
     │   ├── nodes.dmp               # 198 MB — tree structure + ranks   ✅ on gputee
     │   └── taxdump.tar.gz
-    ├── npatlas/                    # ⚠️ NOT migrated to gputee (see §4.1)
-    │   └── NPAtlas_download.json   # 36,454 compounds (454 MB)
+    ├── npatlas/
+    │   └── NPAtlas_download.json   # 36,454 compounds (454 MB)         ✅ on gputee (restored 2026-04-28)
     ├── pfam/
     │   └── Pfam-A.hmm              # Pfam 37.0 — 21,979 families (1.6 GB)  ✅ on gputee
     ├── antismash_db/
     │   ├── asdb5_gbks.tar          # 173 GB — 56,846 genomes           ⚠️ NOT migrated (source tar; JSONL below is intact)
     │   └── asdb5_taxa.json.gz      # 946 KB — pre-computed lineage     ✅ on gputee
-    ├── uniref50/                   # 29 GB — MMseqs2 UniRef50 DB       ⚠️ NOT migrated (blocks Metric 8)
+    ├── uniref50/                   # 29 GB — MMseqs2 UniRef50 DB       ✅ on gputee (restored 2026-04-28)
     └── processed/
         ├── mibig_train_records.jsonl           # 2,636 records (MIBiG only)             ✅ on gputee
         ├── asdb5_train_records.jsonl           # 343,923 records (antiSMASH v5, edge)   ✅ on gputee
@@ -238,9 +238,12 @@ All data is stored under `data/` and excluded from git (`.gitignore`).
 
 ### 4.1  What was downloaded
 
-Status reflects the **gputee** filesystem as of 2026-04-22. Three artefacts
-were not copied from trojai during the migration; the "Blocks" column
-lists the downstream steps each one is required for.
+**Baseline:** trojai→gputee migration snapshot (2026-04-22). **NPAtlas** and **UniRef50**
+were restored under `data/` on **2026-04-28** (see §3.4, §13.2, and the archived
+`readiness_20260428_104336.json` snapshot). The **173 GB** antiSMASH DB v5 source
+tar remains absent on gputee; processed JSONL is present for training.
+
+The "Blocks" column lists downstream impact **only if** an artefact is missing.
 
 
 | Dataset             | Version  | Files                               | Size       | Status (gputee)                                                          | Blocks (if missing)                                 |
@@ -248,24 +251,23 @@ lists the downstream steps each one is required for.
 | MIBiG JSON          | 4.0      | 3,013 JSON files                    | 9.6 MB     | ✅ Present                                                                |                                                     |
 | MIBiG GBK           | 4.0      | ~2,900 GenBank files                | 80 MB      | ✅ Present                                                                |                                                     |
 | MIBiG protein seqs  | 4.0      | 1 FASTA                             | 31 MB      | ✅ Present                                                                |                                                     |
-| NPAtlas             | 3.0      | 1 JSON (36,454 compounds)           | 454 MB     | ❌ **Not migrated** — `data/npatlas/` exists but is empty                 | §5.5 SMILES audit; Phase 3 SMILES conditioning      |
+| NPAtlas             | 3.0      | 1 JSON (36,454 compounds)           | 454 MB     | ✅ **Present** — `data/npatlas/NPAtlas_download.json`                       | §5.5 SMILES audit; Phase 3 SMILES conditioning      |
 | Pfam-A.hmm          | 37.0     | 1 HMM file (21,979 families)        | 1.6 GB     | ✅ Present                                                                |                                                     |
 | NCBI Taxonomy       | Apr 2026 | names.dmp + nodes.dmp               | 464 MB     | ✅ Present                                                                |                                                     |
 | antiSMASH ref DBs   | —        | via `download-antismash-databases`  | ~15 GB     | ⚠️ To verify after env create (installed inside the conda env share dir) | Metric 1 (antiSMASH class prediction)               |
-| **antiSMASH DB v5** | **v5**   | **56,846 genomes / ~497K BGCs**     | **173 GB** | ❌ **Not migrated** — only the 48 MB `asdb5_beta2_gbks.tar` is here       | Re-processing only — JSONL output already migrated  |
+| **antiSMASH DB v5** | **v5**   | **56,846 genomes / ~497K BGCs**     | **173 GB** | ❌ **Source tar not on host** — JSONL output migrated (see §4.3)          | Re-processing only — JSONL output already migrated  |
 | antiSMASH taxa JSON | v5       | Pre-computed lineage for 29K taxids | 946 KB     | ✅ Present                                                                |                                                     |
-| UniRef50            | —        | MMseqs2 DB                          | 29 GB      | ❌ **Not migrated** — `data/uniref50/` exists but is empty                | Metric 8 (protein homology vs UniRef50)             |
+| UniRef50            | —        | MMseqs2 DB                          | 29 GB      | ✅ **Present** — `data/uniref50/uniref50`                                   | Metric 8 (protein homology vs UniRef50)             |
 
 The 343,923-record `asdb5_train_records.jsonl` (21 GB) **was** migrated,
 so training does not require re-running the antiSMASH DB v5 pipeline —
 the 173 GB source tar only needs to be re-downloaded if you want to
 regenerate the JSONL from scratch.
 
-To un-block each missing item:
+If something is missing or corrupt:
 
-- **NPAtlas**: `wget -O data/npatlas/NPAtlas_download.json "https://www.npatlas.org/api/v1/compounds/full"` (454 MB)
-- **UniRef50**: `mmseqs databases UniRef50 data/uniref50/uniref50 tmp/` (~29 GB; **check disk first** — currently only 74 GiB free on /home)
-- **asdb5_gbks.tar**: `wget -c https://dl.secondarymetabolites.org/database/5.0/asdb5_gbks.tar` (**173 GB — will not fit** on current /home; defer until disk is freed or a different mount is used)
+- **NPAtlas / UniRef50:** recovery downloads — §4.2 (`wget` / `mmseqs databases`). Prefer **`/data2`** for large rebuilds when **`/home`** is tight (§3.3).
+- **asdb5_gbks.tar**: `wget -c https://dl.secondarymetabolites.org/database/5.0/asdb5_gbks.tar` (**173 GB** — needs a mount with space; not required if using migrated JSONL only)
 
 
 
@@ -1081,7 +1083,7 @@ meaningfully before investing in the SMILES infrastructure.
 | 5   | Sequence naturalness         | Evo2 base model perplexity | Secondary   | **Yes** | ✅ Implemented & tested (A40 GPU) |
 | 6   | Structural novelty           | BiG-SCAPE 2.0              | Secondary   | No      | ✅ Implemented, needs testing     |
 | 7   | Organism compatibility       | CAI + GC% + dinucleotide   | Secondary   | No      | ✅ Implemented & tested           |
-| 8   | Protein homology             | MMseqs2 vs UniRef50        | Descriptive | No      | ✅ Implemented, needs UniRef50 DB |
+| 8   | Protein homology             | MMseqs2 vs UniRef50        | Descriptive | No      | ✅ Implemented & tested (UniRef50 DB present — §4.1) |
 
 
 ### Metric details
@@ -1362,24 +1364,26 @@ detectable before HPLC.
 | **⭐ NEXT on gputee: `L=32768` pilot on real combined splits** | Smoke + AC ✅; combined JSONL ✅ | Stay on **`--max-seq-len 32768`** for this step. Run a **short pilot** on `data/processed/splits_combined/{train,val}.jsonl` with **production-like settings** (`--batch-size 4`, `--grad-accum 32`, default activation checkpointing, **no** `--smoke-pad-to-max-seq-len`) and enough steps to hit at least one validation and checkpoint path. **Goals:** confirm the stack runs end-to-end on real (variable-length) data, `train_log.jsonl` / `val_log.jsonl` / `config.json` (and related artefacts) contain what we need, and behaviour matches expectations before locking in a multi-day full run. Optional: archive `readiness.json` + run metadata beside the pilot output dir. |
 | Optional: midpoint bracketing (`L=73728 81920 90112`) | Long-L probe ✅ | Completed padded long-L probe (`queued_smoke_20260426_185444`): `L=49152` pass at 59.44 GB, `L=65536` pass at 74.11 GB, `L=98304` OOM. Ceiling is bracketed between 65k and 98k. Only needed if we want a tighter upper bound **before** revisiting stretch `L`; **not** blocking the 32k pilot or a conservative production launch. |
 | Per-block activation checkpointing **(implemented + validated 2026-04-26)** | — | Implemented in `scripts/finetune_evo2_lora.py::enable_block_activation_checkpointing()` and now default-on (explicit opt-out via `--no-activation-checkpointing`). Validation sweep shows major memory reduction and successful `L=32768` smoke pass. Keep using `use_reentrant=False` because `--lora-dropout` is non-zero. Details and logs in `FINETUNE_GUIDE.md` §12.7. |
-| Fine-tune Evo2 7B                               | Combined splits ✅ + smoke decisions ✅ | `L=32768` is now a well-supported conservative default on gputee with AC. `L=65536` is feasible in smoke runs but near memory limits; treat as stretch target pending a production-like preflight. Keep `--grad-accum 32` on gputee to preserve the original 128-sequence effective batch from the 4× A40 defaults. |
+| Fine-tune Evo2 7B                               | Combined splits ✅ + smoke decisions ✅ + production-like preflight ✅ | **`L=32768`** — conservative default with comfortable memory margin. **`L=65536`** — stretch: passed queued production-like preflight (~74 GB peak; see §13 **Completed milestones** and `FINETUNE_GUIDE.md` §12.7.1); choose vs 32k based on pilot quality + wall-clock. Keep **`--grad-accum 32`** on gputee to preserve the original 128-sequence effective batch from the 4× A40 defaults. |
 | Generate BGC sequences                          | Fine-tuned model                 | Condition on target class + E. coli taxonomy tag                             |
-| Full 8-metric evaluation of generated sequences | Generated sequences + restored NPAtlas + UniRef50 (§4.1) | All 8 metrics operational; main project deliverable. M5/M8 blocked on the two missing data directories. |
+| Full 8-metric evaluation of generated sequences | Generated sequences + NPAtlas + UniRef50 (§4.1, §13.2) | All eight metrics are operational end-to-end on gputee once a checkpoint exists; main project deliverable. |
 | Test BiG-SCAPE metric (M6) end-to-end           | antiSMASH DBs installed          | Needs GenBank output from M1; structural novelty scoring                     |
 | Identify wet lab collaborator                   | —                                | Parallel track; not blocking computational work                              |
 
 
-### 13.1  Production run scaffolding (start now; final `L` can remain pending)
+### 13.1  Production run scaffolding (final `--max-seq-len` is the remaining training knob)
 
 **Immediate path:** run the **`L=32768` pilot on combined splits** (§13 table,
 ⭐ NEXT) before scaling to the full 2-epoch job. That pilot validates logging,
-checkpoints, validation cadence, and wall-clock on **natural collation**; treat
-stretch `L=65536` and extra preflight only after the pilot is green.
+checkpoints, validation cadence, and wall-clock on **natural collation**. Prefer
+confirming **`L=65536`** only after that pilot is green (stretch memory was
+validated separately in queued preflight — see §13 **Completed milestones**).
 
-The only open training decision for *full* production is still final
-`--max-seq-len` (`32768` conservative vs `65536` stretch). Everything else
-should be prepared now so launch is a single switch flip once preflight
-resolves (for stretch `L` only).
+The main open training decision for *full* production is still final
+`--max-seq-len` (`32768` conservative vs `65536` stretch). Production-like
+preflight for stretch **`L` has already passed** (memory and throughput —
+see §13 **Completed milestones**); the **`L=32768` pilot on combined splits**
+(⭐ NEXT) still gates locking wall-clock before a multi-day job.
 
 Scaffolding is now concretely defined:
 
@@ -1389,10 +1393,9 @@ Scaffolding is now concretely defined:
      `train_log.jsonl`, `checkpoints/`, `final_adapter/`.
 
 2. **Decision gate (codified):**
-   - Use `L=65536` only if the **queued production-like preflight** is clean
-     (idle-gpu gated launch, padded collation, stable multi-step window,
-     no OOM).
-   - Otherwise use `L=32768`.
+   - **Preflight:** queued production-like preflight for stretch lengths **completed cleanly** (2026-04-29→2026-05-01; see §13 **Completed milestones**).
+   - Use **`L=65536`** only if you accept the **~74 GB peak** VRAM profile and longer wall-clock vs **`L=32768`**, and the **32k pilot** on natural collation is green.
+   - Otherwise prefer **`L=32768`** for maximum margin.
 
 3. **Launch templates prepared (only `--max-seq-len` differs):**
 

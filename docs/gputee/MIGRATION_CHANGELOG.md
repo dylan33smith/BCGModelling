@@ -101,14 +101,14 @@ artefact itself is A40-specific and must change).
 | D15 | `docs/gputee/FINETUNE_GUIDE.md` §8 training trajectory table | Describes loss/steps assumptions; not strictly hardware-specific | **KEEP** | Trajectory shapes are about the model+data, not the GPU. |
 | D16 | `docs/gputee/FINETUNE_GUIDE.md` §12 smoke-test findings | All bugs & memory numbers were observed on 4× A40 | **EDIT (relabel)** | Very valuable history — keep the text verbatim but prepend a clear "These findings are from the trojai smoke tests on 4× A40. A re-run on gputee is pending." note. Do not rewrite the historical record. |
 | D17 | `docs/gputee/README.md` | Was simply a pointer to `PROJECT_GUIDE.md` in the old root layout | **EDIT (small)** | Update paths to match the new folder layout. |
-| D18 | `docs/gputee/BGC_Research_Plan.md` | Contains one off-hand reference to an RTX A6000 / BioNeMo as a compute option | **KEEP** | This is a research-plan document (compute options landscape), not a hardware reference for this server. Out of scope for a hardware migration. Leave unchanged. |
+| D18 | `docs/gputee/BGC_Research_Plan.md` | Legacy draft framed BioNeMo + A6000 and claimed LoRA was incompatible with Evo2 | **SUPERSEDED (2026-05-11)** | Refreshed to **Version 9**: aligns with implemented LoRA trainer, gputee H100, antiSMASH DB v5 / `splits_combined`, and Phase 1 vs Phase 2+ conditioning. Earlier migration note "leave unchanged" applied only to the initial hardware cutover. |
 
 #### Deliberately out of scope
 
 - **No hyperparameter changes applied to the scripts.** User said "don't add new features". Overrides are documented in the guide instead.
 - **No DeepSpeed removal.** Would be a materially new training path that needs its own smoke-test; explicitly out of scope.
 - **No FP8 / Transformer-Engine / flash-attn bump.** These would be H100 performance features, not migration fixes.
-- **No data-movement changes.** Per user instruction, data is untouched. The two empty `data/npatlas/` and `data/uniref50/` directories and the missing `asdb5_gbks.tar` are recorded in the guide as "not migrated" with downstream-impact notes only.
+- **No data-movement changes (initial migration only).** Per user instruction, bulk data was untouched during the trojai→gputee cutover. **Later (2026-04-28)** NPAtlas + UniRef50 were restored under `data/` on gputee; `PROJECT_GUIDE.md` §4.1 / §13.2 reflect that. The missing **`asdb5_gbks.tar`** (173 GB source) remains optional because processed JSONL migrated.
 
 ---
 
@@ -828,11 +828,12 @@ changes in this entry.
   unchanged. The CUDA 12.4 torch wheel is forward-compatible with the
   CUDA 12.9 driver on gputee. A torch / flash-attn bump is an H100
   performance optimisation, not a migration fix.
-- **`BGC_Research_Plan.md`** is unchanged on both sides. It is a research
-  plan, not a hardware reference.
-- **All data files.** Per the user's explicit instruction, no data was
-  copied, moved, or deleted. The three "not migrated" items in
-  `PROJECT_GUIDE.md` §4.1 are a status-only record.
+- **`BGC_Research_Plan.md`** was left unchanged during the **initial**
+  migration PR; it was **refreshed to Version 9 on 2026-05-11** so it matches
+  the implemented trainer and gputee ops story (see D18 above).
+- **All data files** during the migration PR: no bulk copy/move/delete per user
+  instruction. Subsequent restores (NPAtlas, UniRef50) are documented in
+  `PROJECT_GUIDE.md` §4.1 / §13.2.
 - **The `docs/trojai/` tree.** Pristine snapshot of what was in the repo
   root before the migration.
 
