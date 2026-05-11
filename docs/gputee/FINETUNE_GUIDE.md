@@ -1384,35 +1384,55 @@ opportunity for the two paths to drift.
 from ~25.4 GB → ~390 MB. A full production run at default retention
 (`keep_last_ckpts=5`) goes from ~150 GB in flight to ~3 GB.
 
-**Impact on resume correctness:** none. Verify with a short
-smoke-resume sequence:
-1. run N steps with `--save-every 1`
-2. kill after step 2
-3. rerun with `--resume-from .../checkpoints/step_2`
-4. confirm step counter + lr + loss continue consistently
+**Impact on resume correctness:** the `exclude_frozen_parameters=True`
+flag means the DeepSpeed checkpoint's `mp_rank_00_model_states.pt` only
+contains LoRA-trainable params, not the 6.5B frozen base weights. This
+is correct by design — the adapter weights are loaded via
+`PeftModel.from_pretrained` and the frozen base is reloaded from the HF
+cache on every run — but the resume path required four compatibility
+fixes to work with this layout.
 
-The existing `load_lora_checkpoint` already pulls adapter weights via
-`PeftModel.from_pretrained` and optimizer/scheduler state via
-`model_engine.load_checkpoint`, neither of which depends on the frozen
-base being serialised.
+**Status: resume verified (2026-05-11).** All four bugs found and fixed.
 
-**Status:** fix applied on gputee (not backported to trojai docs, per
-migration policy). Resume verification is **still pending**. The
-L=32,768 pilot (`PROJECT_GUIDE.md` §13 NEXT) will exercise the save
-path at `--save-every 500` on real data; resume-correctness should be
-verified as a follow-up step on that pilot's checkpoint **before** the
-multi-day production launch.
+### 12.8.1  Resume-from-checkpoint verification (2026-05-11)
 
-Suggested resume verification protocol:
-1. After the pilot reaches step ≥500, kill it (Ctrl-C in the tmux pane).
-2. Relaunch with the same flags plus
-   `--resume-from /data2/.../checkpoints/step_500`.
-3. Confirm `train_log.jsonl` continues with `step=501, 502, …` (not
-   restarting at 1) and that the LR matches what the cosine schedule
-   would produce at that step.
-4. Confirm GPU peak memory after resume matches the pre-kill peak
-   (within ~1 GB) — a mismatch could indicate the frozen base was
-   re-serialised somewhere.
+**Procedure:** two-phase test at L=1024 on gputee, run directly (not
+queued — GPU had ~34 GB free alongside another user's process).
+
+- **Phase 1:** 5 steps with `--save-every 2` → checkpoints at steps 2, 4, 5.
+  Output: `/data2/ds85/bgcmodel_runs/resume_test_direct/phase1/`
+- **Phase 2:** resumed from `phase1/checkpoints/step_2`, ran to step 5.
+  Output: `/data2/ds85/bgcmodel_runs/resume_test_direct/phase2/`
+
+**Results:**
+
+| Check | Result |
+|---|---|
+| Step counter | ✅ Phase 2 starts at step 3, ends at step 5 |
+| LR continuity | ✅ Exact match at steps 3, 4, 5 (e.g. step 3 = `4.999999990753644e-05` in both) |
+| Loss range | ✅ Same magnitude; values differ as expected (data sampler re-randomises) |
+| Checkpoint size | ✅ ~390 MB per checkpoint (`exclude_frozen_parameters` working) |
+| GPU peak memory | ✅ 16.35 GB in both phases (identical) |
+
+**Bugs found and fixed in the resume path (all in
+`scripts/finetune_evo2_lora.py`):**
+
+| # | Error | Root cause | Fix |
+|---|---|---|---|
+| 1 | `TypeError: 'NoneType' object is not callable` at `model.config.to_dict()` | Same as initial Bug 1: Evo2's vortex `dotdict` returns `None` for missing attributes instead of raising `AttributeError`. The `apply_lora` path had a shim but `PeftModel.from_pretrained` hits the same call via a different code path. | Inject `model.config["to_dict"]` shim before `PeftModel.from_pretrained`, identical to the `apply_lora` Fix 1. |
+| 2 | `AttributeError: module 'torch' has no attribute 'float8_e8m0fnu'` | Same as initial Bug 2: peft 0.19 auto-casts adapters to fp8 dtypes not present in torch 2.5. `apply_lora` passed `autocast_adapter_dtype=False` to `get_peft_model`, but `PeftModel.from_pretrained` has its own separate parameter. | Pass `autocast_adapter_dtype=False` to `PeftModel.from_pretrained`. |
+| 3 | `ModuleNotFoundError: No module named 'transformers.integrations.tensor_parallel'` | peft 0.19's `set_peft_model_state_dict` unconditionally imports `ALL_PARALLEL_STYLES`, `ColwiseParallel`, `EmbeddingParallel`, `RowwiseParallel` from a module that only exists in transformers ≥ 4.50. We're pinned to 4.46.3. The initial `get_peft_model` path doesn't call `set_peft_model_state_dict`, so this never surfaced before. | Register a stub `types.ModuleType` at `transformers.integrations.tensor_parallel` with dummy names before calling `from_pretrained`. The TP sharding code never fires in our single-GPU setup (requires `_hf_tp_plan` / `_hf_device_mesh` on layers). |
+| 4 | `RuntimeError: Missing key(s) in state_dict` (all frozen base-model keys) | DeepSpeed's `load_checkpoint` calls `load_state_dict` in strict mode by default. The checkpoint only contains LoRA-trainable params (because of `exclude_frozen_parameters=True`), but the PeftModel's state dict includes all frozen `base_model.*` keys. | Pass `load_module_strict=False` to `model_engine.load_checkpoint` in `load_lora_checkpoint()`. The adapter weights are already correct from `PeftModel.from_pretrained`; only the optimizer/scheduler state and client_state (step counter, `best_val_loss`) are needed from the DeepSpeed checkpoint. |
+
+All four bugs are in the resume code path only — the forward (initial
+training) path is unaffected. Bugs 1–3 are peft 0.19 / torch 2.5 /
+transformers 4.46.3 version-gap issues; Bug 4 is a consequence of
+`exclude_frozen_parameters=True` interacting with the peft wrapper's
+expanded state dict.
+
+A queued resume-test script is available at
+`scripts/queue_h100_resume_test.sh` for re-verification after any
+checkpoint-related changes.
 
 ---
 

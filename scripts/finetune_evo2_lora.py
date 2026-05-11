@@ -613,9 +613,19 @@ def save_lora_checkpoint(model_engine, args: argparse.Namespace,
 
 
 def load_lora_checkpoint(model_engine, resume_from: Path) -> tuple[int, float]:
-    """Load DeepSpeed optimizer state for resume. Returns (step, best_val_loss)."""
+    """Load DeepSpeed optimizer state for resume. Returns (step, best_val_loss).
+
+    The checkpoint was saved with exclude_frozen_parameters=True, so
+    mp_rank_00_model_states.pt only contains LoRA-trainable params.
+    The frozen base-model weights are already loaded from the HF cache,
+    and the LoRA adapter weights are already restored via
+    PeftModel.from_pretrained. We pass load_module_strict=False so
+    DeepSpeed doesn't error on the missing frozen-param keys — the
+    optimizer states and client_state (step counter, best_val_loss)
+    are the only things we need from this checkpoint."""
     _, client_state = model_engine.load_checkpoint(
-        str(resume_from.parent), tag=resume_from.name
+        str(resume_from.parent), tag=resume_from.name,
+        load_module_strict=False,
     )
     step          = int(client_state.get("step", 0)) if client_state else 0
     best_val_loss = float(client_state.get("best_val_loss", float("inf"))) if client_state else float("inf")
@@ -841,9 +851,40 @@ def main() -> None:
     # Load adapter from checkpoint if resuming, otherwise apply fresh config.
     if args.resume_from is not None and (args.resume_from / "adapter").exists():
         from peft import PeftModel
+        # Fix: peft's BaseTuner.get_model_config() calls model.config.to_dict().
+        # Evo2's vortex dotdict returns None for missing attribute lookups
+        # (same shim as apply_lora Fix 1 — needed on the from_pretrained path too).
+        try:
+            model.config["to_dict"] = lambda: {
+                k: v for k, v in model.config.items()
+                if not callable(v)
+            }
+        except Exception:
+            pass
+        # Fix 3: peft 0.19's set_peft_model_state_dict tries to import
+        # transformers.integrations.tensor_parallel (ALL_PARALLEL_STYLES,
+        # ColwiseParallel, EmbeddingParallel, RowwiseParallel), which only
+        # exists in transformers >= 4.50. We're pinned to 4.46.3. Provide
+        # a stub module with dummy names so the import doesn't crash. The
+        # TP sharding logic never fires in our single-GPU setup — it only
+        # activates when layers have `_hf_tp_plan` / `_hf_device_mesh`.
+        import types, sys as _sys
+        _tp_mod_name = "transformers.integrations.tensor_parallel"
+        if _tp_mod_name not in _sys.modules:
+            _stub = types.ModuleType(_tp_mod_name)
+            _stub.ALL_PARALLEL_STYLES = {}
+            _stub.ColwiseParallel = None
+            _stub.EmbeddingParallel = None
+            _stub.RowwiseParallel = None
+            _stub.gather_state_dict_for_save = None
+            _sys.modules[_tp_mod_name] = _stub
+
         rank0_print(f"  Loading LoRA adapter from {args.resume_from / 'adapter'}")
+        # Fix 2 (resume path): peft 0.19 tries to auto-cast adapters to
+        # float8_e8m0fnu, which doesn't exist in torch 2.5.
         model = PeftModel.from_pretrained(
-            model, str(args.resume_from / "adapter"), is_trainable=True
+            model, str(args.resume_from / "adapter"), is_trainable=True,
+            autocast_adapter_dtype=False,
         )
         rank0_print("  Adapter loaded (weights restored)")
     else:
